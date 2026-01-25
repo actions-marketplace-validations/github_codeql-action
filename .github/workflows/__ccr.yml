@@ -3,7 +3,7 @@
 #     pr-checks/sync.sh
 # to regenerate this file.
 
-name: PR Check - Swift analysis using autobuild
+name: PR Check - CCR
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
@@ -29,16 +29,32 @@ defaults:
     shell: bash
 concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
-  group: swift-autobuild-${{github.ref}}
+  group: ccr-${{github.ref}}
 jobs:
-  swift-autobuild:
+  ccr:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: ubuntu-latest
+            version: stable-v2.17.6
+          - os: ubuntu-latest
+            version: stable-v2.18.4
+          - os: ubuntu-latest
+            version: stable-v2.19.4
+          - os: ubuntu-latest
+            version: stable-v2.20.7
+          - os: ubuntu-latest
+            version: stable-v2.21.4
+          - os: ubuntu-latest
+            version: stable-v2.22.4
+          - os: ubuntu-latest
+            version: default
+          - os: ubuntu-latest
+            version: linked
+          - os: ubuntu-latest
             version: nightly-latest
-    name: Swift analysis using autobuild
+    name: CCR
     if: github.triggering_actor != 'dependabot[bot]'
     permissions:
       contents: read
@@ -58,23 +74,14 @@ jobs:
       - uses: ./../action/init
         id: init
         with:
-          languages: swift
-          build-mode: autobuild
+          languages: javascript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
-      - name: Check working directory
-        run: pwd
-      - uses: ./../action/autobuild
-        timeout-minutes: 30
+
       - uses: ./../action/analyze
         id: analysis
         with:
           upload-database: false
-      - name: Check database
-        run: |
-          SWIFT_DB="${{ fromJson(steps.analysis.outputs.db-locations).swift }}"
-          if [[ ! -d "$SWIFT_DB" ]]; then
-            echo "Did not create a database for Swift."
-            exit 1
-          fi
+
     env:
+      CODEQL_ACTION_ANALYSIS_KEY: dynamic/copilot-pull-request-reviewer/codeql-action-test
       CODEQL_ACTION_TEST_MODE: true
