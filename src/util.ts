@@ -11,8 +11,10 @@ import * as semver from "semver";
 
 import * as apiCompatibility from "./api-compatibility.json";
 import type { CodeQL, VersionInfo } from "./codeql";
-import type { Config, Pack } from "./config-utils";
+import type { Pack } from "./config/db-config";
+import type { Config } from "./config-utils";
 import { EnvVar } from "./environment";
+import * as json from "./json";
 import { Language } from "./languages";
 import { Logger } from "./logging";
 
@@ -54,78 +56,6 @@ const DEFAULT_RESERVED_RAM_SCALING_FACTOR = 0.05;
  */
 const MINIMUM_CGROUP_MEMORY_LIMIT_BYTES = 1024 * 1024;
 
-export interface SarifFile {
-  version?: string | null;
-  runs: SarifRun[];
-}
-
-export interface SarifRun {
-  tool?: {
-    driver?: {
-      guid?: string;
-      name?: string;
-      fullName?: string;
-      semanticVersion?: string;
-      version?: string;
-    };
-  };
-  automationDetails?: {
-    id?: string;
-  };
-  artifacts?: string[];
-  invocations?: SarifInvocation[];
-  results?: SarifResult[];
-}
-
-export interface SarifInvocation {
-  toolExecutionNotifications?: SarifNotification[];
-}
-
-export interface SarifResult {
-  ruleId?: string;
-  rule?: {
-    id?: string;
-  };
-  message?: {
-    text?: string;
-  };
-  locations: Array<{
-    physicalLocation: {
-      artifactLocation: {
-        uri: string;
-      };
-      region?: {
-        startLine?: number;
-      };
-    };
-  }>;
-  relatedLocations?: Array<{
-    physicalLocation: {
-      artifactLocation: {
-        uri: string;
-      };
-      region?: {
-        startLine?: number;
-      };
-    };
-  }>;
-  partialFingerprints: {
-    primaryLocationLineHash?: string;
-  };
-}
-
-export interface SarifNotification {
-  locations?: SarifLocation[];
-}
-
-export interface SarifLocation {
-  physicalLocation?: {
-    artifactLocation?: {
-      uri?: string;
-    };
-  };
-}
-
 /**
  * Get the extra options for the codeql commands.
  */
@@ -143,25 +73,6 @@ export function getExtraOptionsEnvParam(): object {
       `${varName} environment variable is set, but does not contain valid JSON: ${error.message}`,
     );
   }
-}
-
-/**
- * Get the array of all the tool names contained in the given sarif contents.
- *
- * Returns an array of unique string tool names.
- */
-export function getToolNames(sarif: SarifFile): string[] {
-  const toolNames = {};
-
-  for (const run of sarif.runs || []) {
-    const tool = run.tool || {};
-    const driver = tool.driver || {};
-    if (typeof driver.name === "string" && driver.name.length > 0) {
-      toolNames[driver.name] = true;
-    }
-  }
-
-  return Object.keys(toolNames);
 }
 
 // Creates a random temporary directory, runs the given body, and then deletes the directory.
@@ -690,26 +601,18 @@ export class HTTPError extends Error {
  * An Error class that indicates an error that occurred due to
  * a misconfiguration of the action or the CodeQL CLI.
  */
-export class ConfigurationError extends Error {
-  constructor(message: string) {
-    super(message);
-  }
-}
+export class ConfigurationError extends Error {}
 
 export function asHTTPError(arg: any): HTTPError | undefined {
-  if (
-    typeof arg !== "object" ||
-    arg === null ||
-    typeof arg.message !== "string"
-  ) {
+  if (!json.isObject<any>(arg) || !json.isString(arg.message)) {
     return undefined;
   }
   if (Number.isInteger(arg.status)) {
-    return new HTTPError(arg.message as string, arg.status as number);
+    return new HTTPError(arg.message, arg.status as number);
   }
   // See https://github.com/actions/toolkit/blob/acb230b99a46ed33a3f04a758cd68b47b9a82908/packages/tool-cache/src/tool-cache.ts#L19
   if (Number.isInteger(arg.httpStatusCode)) {
-    return new HTTPError(arg.message as string, arg.httpStatusCode as number);
+    return new HTTPError(arg.message, arg.httpStatusCode as number);
   }
   return undefined;
 }
@@ -744,6 +647,7 @@ export async function bundleDb(
   language: Language,
   codeql: CodeQL,
   dbName: string,
+  { includeDiagnostics }: { includeDiagnostics: boolean },
 ) {
   const databasePath = getCodeQLDatabasePath(config, language);
   const databaseBundlePath = path.resolve(config.dbLocation, `${dbName}.zip`);
@@ -774,6 +678,7 @@ export async function bundleDb(
     databasePath,
     databaseBundlePath,
     dbName,
+    includeDiagnostics,
     additionalFiles,
   );
   return databaseBundlePath;
@@ -983,80 +888,6 @@ export function parseMatrixInput(
     return undefined;
   }
   return JSON.parse(matrixInput) as { [key: string]: string };
-}
-
-function removeDuplicateLocations(locations: SarifLocation[]): SarifLocation[] {
-  const newJsonLocations = new Set<string>();
-  return locations.filter((location) => {
-    const jsonLocation = JSON.stringify(location);
-    if (!newJsonLocations.has(jsonLocation)) {
-      newJsonLocations.add(jsonLocation);
-      return true;
-    }
-    return false;
-  });
-}
-
-export function fixInvalidNotifications(
-  sarif: SarifFile,
-  logger: Logger,
-): SarifFile {
-  if (!Array.isArray(sarif.runs)) {
-    return sarif;
-  }
-
-  // Ensure that the array of locations for each SARIF notification contains unique locations.
-  // This is a workaround for a bug in the CodeQL CLI that causes duplicate locations to be
-  // emitted in some cases.
-  let numDuplicateLocationsRemoved = 0;
-
-  const newSarif = {
-    ...sarif,
-    runs: sarif.runs.map((run) => {
-      if (
-        run.tool?.driver?.name !== "CodeQL" ||
-        !Array.isArray(run.invocations)
-      ) {
-        return run;
-      }
-      return {
-        ...run,
-        invocations: run.invocations.map((invocation) => {
-          if (!Array.isArray(invocation.toolExecutionNotifications)) {
-            return invocation;
-          }
-          return {
-            ...invocation,
-            toolExecutionNotifications:
-              invocation.toolExecutionNotifications.map((notification) => {
-                if (!Array.isArray(notification.locations)) {
-                  return notification;
-                }
-                const newLocations = removeDuplicateLocations(
-                  notification.locations,
-                );
-                numDuplicateLocationsRemoved +=
-                  notification.locations.length - newLocations.length;
-                return {
-                  ...notification,
-                  locations: newLocations,
-                };
-              }),
-          };
-        }),
-      };
-    }),
-  };
-
-  if (numDuplicateLocationsRemoved > 0) {
-    logger.info(
-      `Removed ${numDuplicateLocationsRemoved} duplicate locations from SARIF notification ` +
-        "objects.",
-    );
-  } else {
-    logger.debug("No duplicate locations found in SARIF notification objects.");
-  }
-  return newSarif;
 }
 
 export function wrapError(error: unknown): Error {
@@ -1291,4 +1122,53 @@ export function joinAtMost(
   }
 
   return array.join(separator);
+}
+
+/** An interface representing something that is either a success or a failure. */
+interface ResultLike<T, E> {
+  /** The value of the result, which can be either a success value or a failure value. */
+  value: T | E;
+  /** Whether this result represents a success. */
+  isSuccess(): this is Success<T>;
+  /** Whether this result represents a failure. */
+  isFailure(): this is Failure<E>;
+  /** Get the value if this is a success, or return the default value if this is a failure. */
+  orElse<U>(defaultValue: U): T | U;
+}
+
+/** A simple result type representing either a success or a failure. */
+export type Result<T, E> = Success<T> | Failure<E>;
+
+/** A result representing a success. */
+export class Success<T> implements ResultLike<T, never> {
+  constructor(public readonly value: T) {}
+
+  isSuccess(): this is Success<T> {
+    return true;
+  }
+
+  isFailure(): this is Failure<never> {
+    return false;
+  }
+
+  orElse<U>(_defaultValue: U): T {
+    return this.value;
+  }
+}
+
+/** A result representing a failure. */
+export class Failure<E> implements ResultLike<never, E> {
+  constructor(public readonly value: E) {}
+
+  isSuccess(): this is Success<never> {
+    return false;
+  }
+
+  isFailure(): this is Failure<E> {
+    return true;
+  }
+
+  orElse<U>(defaultValue: U): U {
+    return defaultValue;
+  }
 }

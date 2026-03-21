@@ -3,7 +3,7 @@
 #     pr-checks/sync.sh
 # to regenerate this file.
 
-name: PR Check - CCR
+name: 'PR Check - Bundle: From nightly'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
@@ -18,6 +18,9 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  merge_group:
+    types:
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -29,32 +32,16 @@ defaults:
     shell: bash
 concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
-  group: ccr-${{github.ref}}
+  group: bundle-from-nightly-${{github.ref}}
 jobs:
-  ccr:
+  bundle-from-nightly:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            version: stable-v2.17.6
-          - os: ubuntu-latest
-            version: stable-v2.18.4
-          - os: ubuntu-latest
-            version: stable-v2.19.4
-          - os: ubuntu-latest
-            version: stable-v2.20.7
-          - os: ubuntu-latest
-            version: stable-v2.21.4
-          - os: ubuntu-latest
-            version: stable-v2.22.4
-          - os: ubuntu-latest
-            version: default
-          - os: ubuntu-latest
             version: linked
-          - os: ubuntu-latest
-            version: nightly-latest
-    name: CCR
+    name: 'Bundle: From nightly'
     if: github.triggering_actor != 'dependabot[bot]'
     permissions:
       contents: read
@@ -71,17 +58,15 @@ jobs:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
           setup-kotlin: 'true'
-      - uses: ./../action/init
-        id: init
+      - id: init
+        uses: ./../action/init
+        env:
+          CODEQL_ACTION_FORCE_NIGHTLY: true
         with:
-          languages: javascript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
-
-      - uses: ./../action/analyze
-        id: analysis
-        with:
-          upload-database: false
-
+          languages: javascript
+      - name: Fail if the CodeQL version is not a nightly
+        if: ${{ !contains(steps.init.outputs.codeql-version, '+') }}
+        run: exit 1
     env:
-      CODEQL_ACTION_ANALYSIS_KEY: dynamic/copilot-pull-request-reviewer/codeql-action-test
       CODEQL_ACTION_TEST_MODE: true

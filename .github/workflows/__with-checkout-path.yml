@@ -18,49 +18,41 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  merge_group:
+    types:
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
-      go-version:
-        type: string
-        description: The version of Go to install
-        required: false
-        default: '>=1.21.0'
-      python-version:
-        type: string
-        description: The version of Python to install
-        required: false
-        default: '3.13'
       dotnet-version:
         type: string
         description: The version of .NET to install
         required: false
         default: 9.x
+      go-version:
+        type: string
+        description: The version of Go to install
+        required: false
+        default: '>=1.21.0'
   workflow_call:
     inputs:
-      go-version:
-        type: string
-        description: The version of Go to install
-        required: false
-        default: '>=1.21.0'
-      python-version:
-        type: string
-        description: The version of Python to install
-        required: false
-        default: '3.13'
       dotnet-version:
         type: string
         description: The version of .NET to install
         required: false
         default: 9.x
+      go-version:
+        type: string
+        description: The version of Go to install
+        required: false
+        default: '>=1.21.0'
 defaults:
   run:
     shell: bash
 concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || false }}
-  group:
-    with-checkout-path-${{github.ref}}-${{inputs.go-version}}-${{inputs.python-version}}-${{inputs.dotnet-version}}
+  group: with-checkout-path-${{github.ref}}-${{inputs.dotnet-version}}-${{inputs.go-version}}
 jobs:
   with-checkout-path:
     strategy:
@@ -77,8 +69,18 @@ jobs:
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
+      # This ensures we don't accidentally use the original checkout for any part of the test.
       - name: Check out repository
         uses: actions/checkout@v6
+      - name: Install .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ inputs.dotnet-version || '9.x' }}
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ inputs.go-version || '>=1.21.0' }}
+          cache: false
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test
@@ -86,28 +88,14 @@ jobs:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
           setup-kotlin: 'true'
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ inputs.go-version || '>=1.21.0' }}
-          cache: false
-      - name: Install Python
-        if: matrix.version != 'nightly-latest'
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ inputs.python-version || '3.13' }}
-      - name: Install .NET
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: ${{ inputs.dotnet-version || '9.x' }}
       - name: Delete original checkout
         run: |
           # delete the original checkout so we don't accidentally use it.
           # Actions does not support deleting the current working directory, so we
           # delete the contents of the directory instead.
           rm -rf ./* .github .git
-  # Check out the actions repo again, but at a different location.
-  # choose an arbitrary SHA so that we can later test that the commit_oid is not from main
+      # Check out the actions repo again, but at a different location.
+      # choose an arbitrary SHA so that we can later test that the commit_oid is not from main
       - uses: actions/checkout@v6
         with:
           ref: 474bbf07f9247ffe1856c6a0f94aeeb10e7afee6
@@ -116,7 +104,7 @@ jobs:
       - uses: ./../action/init
         with:
           tools: ${{ steps.prepare-test.outputs.tools-url }}
-      # it's enough to test one compiled language and one interpreted language
+          # it's enough to test one compiled language and one interpreted language
           languages: csharp,javascript
           source-root: x/y/z/some-path/tests/multi-language-repo
 

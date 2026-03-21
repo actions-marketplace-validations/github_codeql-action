@@ -8,13 +8,13 @@ import {
   getTemporaryDirectory,
   getWorkflowRunAttempt,
   getWorkflowRunID,
-} from "./actions-util";
-import { getAutomationID } from "./api-client";
-import { createCacheKeyHash } from "./caching-utils";
-import { type CodeQL } from "./codeql";
-import { type Config } from "./config-utils";
-import { getCommitOid, getFileOidsUnderPath } from "./git-utils";
-import { Logger, withGroupAsync } from "./logging";
+} from "../actions-util";
+import { getAutomationID } from "../api-client";
+import { createCacheKeyHash } from "../caching-utils";
+import { type CodeQL } from "../codeql";
+import { type Config } from "../config-utils";
+import { getCommitOid, getFileOidsUnderPath } from "../git-utils";
+import { Logger, withGroupAsync } from "../logging";
 import {
   CleanupLevel,
   getBaseDatabaseOidsFilePath,
@@ -23,7 +23,7 @@ import {
   isInTestMode,
   tryGetFolderBytes,
   waitForResultWithTimeLimit,
-} from "./util";
+} from "../util";
 
 export enum OverlayDatabaseMode {
   Overlay = "overlay",
@@ -32,6 +32,16 @@ export enum OverlayDatabaseMode {
 }
 
 export const CODEQL_OVERLAY_MINIMUM_VERSION = "2.23.8";
+
+// Per-language minimum CLI versions for overlay analysis, based on release
+// validation data.
+export const CODEQL_OVERLAY_MINIMUM_VERSION_CPP = "2.25.0";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_CSHARP = "2.24.1";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_GO = "2.24.2";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_JAVA = "2.23.8";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_JAVASCRIPT = "2.23.9";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_PYTHON = "2.23.9";
+export const CODEQL_OVERLAY_MINIMUM_VERSION_RUBY = "2.23.9";
 
 /**
  * The maximum (uncompressed) size of the overlay base database that we will

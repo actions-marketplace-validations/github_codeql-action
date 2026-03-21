@@ -18,6 +18,9 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  merge_group:
+    types:
+      - checks_requested
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
@@ -37,9 +40,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            version: default
-          - os: ubuntu-latest
             version: linked
+          - os: ubuntu-latest
+            version: default
           - os: ubuntu-latest
             version: nightly-latest
     name: Resolve environment
@@ -81,8 +84,7 @@ jobs:
           language: javascript-typescript
 
       - name: Fail if JavaScript/TypeScript configuration present
-        if:
-          fromJSON(steps.resolve-environment-js.outputs.environment).configuration.javascript
+        if: fromJSON(steps.resolve-environment-js.outputs.environment).configuration.javascript
         run: exit 1
     env:
       CODEQL_ACTION_TEST_MODE: true

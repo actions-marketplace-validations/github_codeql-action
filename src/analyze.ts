@@ -5,7 +5,11 @@ import { performance } from "perf_hooks";
 import * as io from "@actions/io";
 import * as yaml from "js-yaml";
 
-import { getTemporaryDirectory, PullRequestBranches } from "./actions-util";
+import {
+  getTemporaryDirectory,
+  getRequiredInput,
+  PullRequestBranches,
+} from "./actions-util";
 import * as analyses from "./analyses";
 import { setupCppAutobuild } from "./autobuild";
 import { type CodeQL } from "./codeql";
@@ -24,7 +28,8 @@ import { EnvVar } from "./environment";
 import { FeatureEnablement, Feature } from "./feature-flags";
 import { KnownLanguage, Language } from "./languages";
 import { Logger, withGroupAsync } from "./logging";
-import { OverlayDatabaseMode } from "./overlay-database-utils";
+import { OverlayDatabaseMode } from "./overlay";
+import type * as sarif from "./sarif";
 import { DatabaseCreationTimings, EventReport } from "./status-report";
 import { endTracingForCluster } from "./tracer-config";
 import * as util from "./util";
@@ -242,7 +247,12 @@ export async function setupDiffInformedQueryRun(
         `Calculating diff ranges for ${branches.base}...${branches.head}`,
       );
       const diffRanges = await getPullRequestEditedDiffRanges(branches, logger);
-      const packDir = writeDiffRangeDataExtensionPack(logger, diffRanges);
+      const checkoutPath = getRequiredInput("checkout_path");
+      const packDir = writeDiffRangeDataExtensionPack(
+        logger,
+        diffRanges,
+        checkoutPath,
+      );
       if (packDir === undefined) {
         logger.warning(
           "Cannot create diff range extension pack for diff-informed queries; " +
@@ -258,6 +268,46 @@ export async function setupDiffInformedQueryRun(
   );
 }
 
+export function diffRangeExtensionPackContents(
+  ranges: DiffThunkRange[],
+  checkoutPath: string,
+): string {
+  const header = `
+extensions:
+  - addsTo:
+      pack: codeql/util
+      extensible: restrictAlertsTo
+      checkPresence: false
+    data:
+`;
+
+  let data = ranges
+    .map((range) => {
+      // Diff-informed queries expect the file path to be absolute. CodeQL always
+      // uses forward slashes as the path separator, so on Windows we need to
+      // replace any backslashes with forward slashes.
+      const filename = path
+        .join(checkoutPath, range.path)
+        .replaceAll(path.sep, "/");
+
+      // Using yaml.dump() with `forceQuotes: true` ensures that all special
+      // characters are escaped, and that the path is always rendered as a
+      // quoted string on a single line.
+      return (
+        `      - [${yaml.dump(filename, { forceQuotes: true }).trim()}, ` +
+        `${range.startLine}, ${range.endLine}]\n`
+      );
+    })
+    .join("");
+  if (!data) {
+    // Ensure that the data extension is not empty, so that a pull request with
+    // no edited lines would exclude (instead of accepting) all alerts.
+    data = '      - ["", 0, 0]\n';
+  }
+
+  return header + data;
+}
+
 /**
  * Create an extension pack in the temporary directory that contains the file
  * line ranges that were added or modified in the pull request.
@@ -265,12 +315,14 @@ export async function setupDiffInformedQueryRun(
  * @param logger
  * @param ranges The file line ranges, as returned by
  * `getPullRequestEditedDiffRanges`.
+ * @param checkoutPath The path at which the repository was checked out.
  * @returns The absolute path of the directory containing the extension pack, or
  * `undefined` if no extension pack was created.
  */
 function writeDiffRangeDataExtensionPack(
   logger: Logger,
   ranges: DiffThunkRange[] | undefined,
+  checkoutPath: string,
 ): string | undefined {
   if (ranges === undefined) {
     return undefined;
@@ -306,32 +358,10 @@ dataExtensions:
 `,
   );
 
-  const header = `
-extensions:
-  - addsTo:
-      pack: codeql/util
-      extensible: restrictAlertsTo
-      checkPresence: false
-    data:
-`;
-
-  let data = ranges
-    .map(
-      (range) =>
-        // Using yaml.dump() with `forceQuotes: true` ensures that all special
-        // characters are escaped, and that the path is always rendered as a
-        // quoted string on a single line.
-        `      - [${yaml.dump(range.path, { forceQuotes: true }).trim()}, ` +
-        `${range.startLine}, ${range.endLine}]\n`,
-    )
-    .join("");
-  if (!data) {
-    // Ensure that the data extension is not empty, so that a pull request with
-    // no edited lines would exclude (instead of accepting) all alerts.
-    data = '      - ["", 0, 0]\n';
-  }
-
-  const extensionContents = header + data;
+  const extensionContents = diffRangeExtensionPackContents(
+    ranges,
+    checkoutPath,
+  );
   const extensionFilePath = path.join(diffRangeDir, "pr-diff-range.yml");
   fs.writeFileSync(extensionFilePath, extensionContents);
   logger.debug(
@@ -495,9 +525,17 @@ export async function runQueries(
         endTimeInterpretResults.getTime() - startTimeInterpretResults.getTime();
       logger.endGroup();
 
-      logger.info(analysisSummary);
-      if (qualityAnalysisSummary) {
+      if (analysisSummary.trim()) {
+        logger.info(analysisSummary);
+      }
+      if (qualityAnalysisSummary?.trim()) {
         logger.info(qualityAnalysisSummary);
+      }
+      if (!config.enableFileCoverageInformation) {
+        logger.info(
+          "To speed up pull request analysis, file coverage information is only enabled when analyzing " +
+            "the default branch and protected branches.",
+        );
       }
 
       if (await features.getValue(Feature.QaTelemetryEnabled)) {
@@ -541,12 +579,9 @@ export async function runQueries(
   ): Promise<{ summary: string; sarifFile: string }> {
     logger.info(`Interpreting ${analysis.name} results for ${language}`);
 
-    // If this is a Code Quality analysis, correct the category to one
-    // accepted by the Code Quality backend.
-    let category = automationDetailsId;
-    if (analysis.kind === analyses.AnalysisKind.CodeQuality) {
-      category = analysis.fixCategory(logger, automationDetailsId);
-    }
+    // Apply the analysis configuration's `fixCategory` function to adjust the category if needed.
+    // This is a no-op for Code Scanning.
+    const category = analysis.fixCategory(logger, automationDetailsId);
 
     const sarifFile = path.join(
       sarifFolder,
@@ -589,7 +624,7 @@ export async function runQueries(
   function getPerQueryAlertCounts(sarifPath: string): Record<string, number> {
     const sarifObject = JSON.parse(
       fs.readFileSync(sarifPath, "utf8"),
-    ) as util.SarifFile;
+    ) as sarif.Log;
     // We do not need to compute fingerprints because we are not sending data based off of locations.
 
     // Generate the query: alert count object

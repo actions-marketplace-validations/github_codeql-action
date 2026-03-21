@@ -29,6 +29,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.HEAD_REF }}
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'npm'
+
       - name: Remove label
         if: github.event_name == 'pull_request'
         env:
@@ -49,8 +55,17 @@ jobs:
           git fetch origin "$BASE_BRANCH"
 
           # Allow merge conflicts in `lib`, since rebuilding should resolve them.
-          git merge "origin/$BASE_BRANCH" || echo "Merge conflicts detected, continuing."
+          git merge "origin/$BASE_BRANCH"
           MERGE_RESULT=$?
+
+          if [ "$MERGE_RESULT" -eq 0 ]; then
+            echo "Merge succeeded cleanly."
+          elif [ "$MERGE_RESULT" -eq 1 ]; then
+            echo "Merge conflicts detected (exit code $MERGE_RESULT), continuing."
+          else
+            echo "git merge failed with unexpected exit code $MERGE_RESULT."
+            exit 1
+          fi
 
           if [ "$MERGE_RESULT" -ne 0 ]; then
             echo "merge-in-progress=true" >> $GITHUB_OUTPUT
@@ -73,24 +88,17 @@ jobs:
           npm run lint -- --fix
           npm run build
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: 3.11
-
       - name: Sync back version updates to generated workflows
         # Only sync back versions on Dependabot update PRs
         if: startsWith(env.HEAD_REF, 'dependabot/')
         working-directory: pr-checks
         run: |
-          python3 sync_back.py -v
+          npm ci
+          npx tsx sync-back.ts --verbose
 
       - name: Generate workflows
         working-directory: pr-checks
-        run: |
-          python -m pip install --upgrade pip
-          pip install ruamel.yaml==0.17.31
-          python3 sync.py
+        run: ./sync.sh
 
       - name: "Merge in progress: Finish merge and push"
         if: steps.merge.outputs.merge-in-progress == 'true'
@@ -111,7 +119,7 @@ jobs:
             # Otherwise, just commit the changes.
             if git rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
               echo "In progress merge detected, finishing it up."
-              git merge --continue
+              git commit --no-edit
             else
               echo "No in-progress merge detected, committing changes."
               git commit -m "Rebuild"

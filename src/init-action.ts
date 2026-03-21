@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import * as core from "@actions/core";
+import * as github from "@actions/github";
 import * as io from "@actions/io";
 import * as semver from "semver";
 import { v4 as uuidV4 } from "uuid";
@@ -30,30 +31,36 @@ import {
 } from "./dependency-caching";
 import {
   addDiagnostic,
+  addNoLanguageDiagnostic,
   flushDiagnostics,
   logUnwrittenDiagnostics,
   makeDiagnostic,
   makeTelemetryDiagnostic,
 } from "./diagnostics";
 import { EnvVar } from "./environment";
-import { Feature, Features } from "./feature-flags";
-import { loadPropertiesFromApi } from "./feature-flags/properties";
+import { Feature, FeatureEnablement, initFeatures } from "./feature-flags";
+import {
+  loadPropertiesFromApi,
+  RepositoryProperties,
+} from "./feature-flags/properties";
 import {
   checkInstallPython311,
   checkPacksForOverlayCompatibility,
   cleanupDatabaseClusterDirectory,
+  getFileCoverageInformationEnabled,
+  logFileCoverageOnPrsDeprecationWarning,
   initCodeQL,
   initConfig,
   runDatabaseInitCluster,
 } from "./init";
-import { KnownLanguage } from "./languages";
+import { JavaEnvVars, KnownLanguage } from "./languages";
 import { getActionsLogger, Logger } from "./logging";
 import {
   downloadOverlayBaseDatabaseFromCache,
   OverlayBaseDatabaseDownloadStats,
   OverlayDatabaseMode,
-} from "./overlay-database-utils";
-import { getRepositoryNwo } from "./repository";
+} from "./overlay";
+import { getRepositoryNwo, RepositoryNwo } from "./repository";
 import { ToolsSource } from "./setup-codeql";
 import {
   ActionName,
@@ -81,12 +88,15 @@ import {
   getRequiredEnvParam,
   getThreadsFlagValue,
   initializeEnvironment,
-  isHostedRunner,
   ConfigurationError,
   wrapError,
   checkActionVersion,
   getErrorMessage,
   BuildMode,
+  Result,
+  getOptionalEnvVar,
+  Success,
+  Failure,
 } from "./util";
 import { checkWorkflow } from "./workflow";
 
@@ -202,7 +212,7 @@ async function run(startedAt: Date) {
   let config: configUtils.Config | undefined;
   let configFile: string | undefined;
   let codeql: CodeQL;
-  let features: Features;
+  let features: FeatureEnablement;
   let sourceRoot: string;
   let toolsDownloadStatusReport: ToolsDownloadStatusReport | undefined;
   let toolsFeatureFlagsValid: boolean | undefined;
@@ -229,7 +239,7 @@ async function run(startedAt: Date) {
 
     const repositoryNwo = getRepositoryNwo();
 
-    features = new Features(
+    features = initFeatures(
       gitHubVersion,
       repositoryNwo,
       getTemporaryDirectory(),
@@ -237,12 +247,10 @@ async function run(startedAt: Date) {
     );
 
     // Fetch the values of known repository properties that affect us.
-    const enableRepoProps = await features.getValue(
-      Feature.UseRepositoryProperties,
+    const repositoryPropertiesResult = await loadRepositoryProperties(
+      repositoryNwo,
+      logger,
     );
-    const repositoryProperties = enableRepoProps
-      ? await loadPropertiesFromApi(gitHubVersion, logger, repositoryNwo)
-      : {};
 
     // Create a unique identifier for this run.
     const jobRunUuid = uuidV4();
@@ -334,6 +342,15 @@ async function run(startedAt: Date) {
     }
 
     analysisKinds = await getAnalysisKinds(logger);
+    const debugMode = getOptionalInput("debug") === "true" || core.isDebug();
+    const repositoryProperties = repositoryPropertiesResult.orElse({});
+    const fileCoverageResult = await getFileCoverageInformationEnabled(
+      debugMode,
+      codeql,
+      features,
+      repositoryProperties,
+    );
+
     config = await initConfig(features, {
       analysisKinds,
       languagesInput: getOptionalInput("languages"),
@@ -344,13 +361,12 @@ async function run(startedAt: Date) {
       configFile,
       dbLocation: getOptionalInput("db-location"),
       configInput: getOptionalInput("config"),
-      trapCachingEnabled: getTrapCachingEnabled(),
       dependencyCachingEnabled: getDependencyCachingEnabled(),
       // Debug mode is enabled if:
       // - The `init` Action is passed `debug: true`.
       // - Actions step debugging is enabled (e.g. by [enabling debug logging for a rerun](https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs#re-running-all-the-jobs-in-a-workflow),
       //   or by setting the `ACTIONS_STEP_DEBUG` secret to `true`).
-      debugMode: getOptionalInput("debug") === "true" || core.isDebug(),
+      debugMode,
       debugArtifactName:
         getOptionalInput("debug-artifact-name") || DEFAULT_DEBUG_ARTIFACT_NAME,
       debugDatabaseName:
@@ -364,8 +380,37 @@ async function run(startedAt: Date) {
       apiDetails,
       features,
       repositoryProperties,
+      enableFileCoverageInformation: fileCoverageResult.enabled,
       logger,
     });
+
+    if (repositoryPropertiesResult.isFailure()) {
+      addNoLanguageDiagnostic(
+        config,
+        makeTelemetryDiagnostic(
+          "codeql-action/repository-properties-load-failure",
+          "Failed to load repository properties",
+          {
+            error: getErrorMessage(repositoryPropertiesResult.value),
+          },
+        ),
+      );
+    }
+
+    if (fileCoverageResult.enabledByRepositoryProperty) {
+      addNoLanguageDiagnostic(
+        config,
+        makeTelemetryDiagnostic(
+          "codeql-action/file-coverage-on-prs-enabled-by-repository-property",
+          "File coverage on PRs enabled by repository property",
+          {},
+        ),
+      );
+    }
+
+    if (fileCoverageResult.showDeprecationWarning) {
+      logFileCoverageOnPrsDeprecationWarning(logger);
+    }
 
     await checkInstallPython311(config.languages, codeql);
   } catch (unwrappedError) {
@@ -429,11 +474,8 @@ async function run(startedAt: Date) {
 
     // Log CodeQL download telemetry, if appropriate
     if (toolsDownloadStatusReport) {
-      addDiagnostic(
+      addNoLanguageDiagnostic(
         config,
-        // Arbitrarily choose the first language. We could also choose all languages, but that
-        // increases the risk of misinterpreting the data.
-        config.languages[0],
         makeTelemetryDiagnostic(
           "codeql-action/bundle-download-telemetry",
           "CodeQL bundle download telemetry",
@@ -569,24 +611,6 @@ async function run(startedAt: Date) {
       core.exportVariable(kotlinLimitVar, "2.1.20");
     }
 
-    if (config.languages.includes(KnownLanguage.cpp)) {
-      const envVar = "CODEQL_EXTRACTOR_CPP_TRAP_CACHING";
-      if (process.env[envVar]) {
-        logger.info(
-          `Environment variable ${envVar} already set. Not en/disabling CodeQL C++ TRAP caching support`,
-        );
-      } else if (
-        getTrapCachingEnabled() &&
-        (await codeQlVersionAtLeast(codeql, "2.17.5"))
-      ) {
-        logger.info("Enabling CodeQL C++ TRAP caching support");
-        core.exportVariable(envVar, "true");
-      } else {
-        logger.info("Disabling CodeQL C++ TRAP caching support");
-        core.exportVariable(envVar, "false");
-      }
-    }
-
     // Restore dependency cache(s), if they exist.
     if (shouldRestoreCache(config.dependencyCachingEnabled)) {
       const dependencyCachingResult = await downloadDependencyCaches(
@@ -598,17 +622,6 @@ async function run(startedAt: Date) {
       dependencyCachingStatus = dependencyCachingResult.statusReport;
       config.dependencyCachingRestoredKeys =
         dependencyCachingResult.restoredKeys;
-    }
-
-    // Suppress warnings about disabled Python library extraction.
-    if (await codeQlVersionAtLeast(codeql, "2.17.1")) {
-      // disabled by default, no warning
-    } else {
-      // disabled by default, prints warning if environment variable is not set
-      core.exportVariable(
-        "CODEQL_EXTRACTOR_PYTHON_DISABLE_LIBRARY_EXTRACTION",
-        "true",
-      );
     }
 
     if (getOptionalInput("setup-python-dependencies") !== undefined) {
@@ -729,6 +742,19 @@ async function run(startedAt: Date) {
       }
     }
 
+    // Enable Java network debugging if the FF is enabled.
+    if (await features.getValue(Feature.JavaNetworkDebugging)) {
+      // Get the existing value of `JAVA_TOOL_OPTIONS`, if any.
+      const existingJavaToolOptions =
+        getOptionalEnvVar(JavaEnvVars.JAVA_TOOL_OPTIONS) || "";
+
+      // Add the network debugging options.
+      core.exportVariable(
+        JavaEnvVars.JAVA_TOOL_OPTIONS,
+        `${existingJavaToolOptions} -Djavax.net.debug=all`,
+      );
+    }
+
     // Write diagnostics to the database that we previously stored in memory because the database
     // did not exist until now.
     flushDiagnostics(config);
@@ -775,27 +801,44 @@ async function run(startedAt: Date) {
   );
 }
 
-function getTrapCachingEnabled(): boolean {
-  // If the workflow specified something always respect that
-  const trapCaching = getOptionalInput("trap-caching");
-  if (trapCaching !== undefined) return trapCaching === "true";
+/**
+ * Loads [repository properties](https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization) if applicable.
+ */
+async function loadRepositoryProperties(
+  repositoryNwo: RepositoryNwo,
+  logger: Logger,
+): Promise<Result<RepositoryProperties, unknown>> {
+  // See if we can skip loading repository properties early. In particular,
+  // repositories owned by users cannot have repository properties, so we can
+  // skip the API call entirely in that case.
+  const repositoryOwnerType = github.context.payload.repository?.owner.type;
+  logger.debug(
+    `Repository owner type is '${repositoryOwnerType ?? "unknown"}'.`,
+  );
+  if (repositoryOwnerType === "User") {
+    logger.debug(
+      "Skipping loading repository properties because the repository is owned by a user and " +
+        "therefore cannot have repository properties.",
+    );
+    return new Success({});
+  }
 
-  // On self-hosted runners which may have slow network access, disable TRAP caching by default
-  if (!isHostedRunner()) return false;
-
-  // On hosted runners, enable TRAP caching by default
-  return true;
+  try {
+    return new Success(await loadPropertiesFromApi(logger, repositoryNwo));
+  } catch (error) {
+    logger.warning(
+      `Failed to load repository properties: ${getErrorMessage(error)}`,
+    );
+    return new Failure(error);
+  }
 }
 
 async function recordZstdAvailability(
   config: configUtils.Config,
   zstdAvailability: ZstdAvailability,
 ) {
-  addDiagnostic(
+  addNoLanguageDiagnostic(
     config,
-    // Arbitrarily choose the first language. We could also choose all languages, but that
-    // increases the risk of misinterpreting the data.
-    config.languages[0],
     makeTelemetryDiagnostic(
       "codeql-action/zstd-availability",
       "Zstandard availability",

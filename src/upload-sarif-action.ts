@@ -4,9 +4,10 @@ import * as actionsUtil from "./actions-util";
 import { getActionVersion, getTemporaryDirectory } from "./actions-util";
 import * as analyses from "./analyses";
 import { getGitHubVersion } from "./api-client";
-import { Features } from "./feature-flags";
+import { initFeatures } from "./feature-flags";
 import { Logger, getActionsLogger } from "./logging";
 import { getRepositoryNwo } from "./repository";
+import { InvalidSarifUploadError } from "./sarif";
 import {
   createStatusReportBase,
   sendStatusReport,
@@ -70,7 +71,7 @@ async function run(startedAt: Date) {
     actionsUtil.persistInputs();
 
     const repositoryNwo = getRepositoryNwo();
-    const features = new Features(
+    const features = initFeatures(
       gitHubVersion,
       repositoryNwo,
       getTemporaryDirectory(),
@@ -141,7 +142,7 @@ async function run(startedAt: Date) {
   } catch (unwrappedError) {
     const error =
       isThirdPartyAnalysis(ActionName.UploadSarif) &&
-      unwrappedError instanceof upload_lib.InvalidSarifUploadError
+      unwrappedError instanceof InvalidSarifUploadError
         ? new ConfigurationError(unwrappedError.message)
         : wrapError(unwrappedError);
     const message = error.message;
