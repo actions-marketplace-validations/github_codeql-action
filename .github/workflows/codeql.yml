@@ -35,7 +35,7 @@ jobs:
       security-events: read
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v6.0.2
     - name: Set up default CodeQL bundle
       id: setup-default
       uses: ./setup-codeql
@@ -87,7 +87,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v6.0.2
     - name: Initialize CodeQL
       uses: ./init
       id: init
@@ -124,7 +124,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v6.0.2
     - name: Initialize CodeQL
       uses: ./init
       with:
