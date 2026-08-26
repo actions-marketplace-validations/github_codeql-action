@@ -4,7 +4,7 @@ import * as path from "path";
 import * as artifact from "@actions/artifact";
 import * as artifactLegacy from "@actions/artifact-legacy";
 import * as core from "@actions/core";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 
 import { getOptionalInput, getTemporaryDirectory } from "./actions-util";
 import { dbIsFinalized } from "./analyze";
@@ -263,7 +263,7 @@ export function getArtifactSuffix(matrix: string | undefined): string {
     try {
       const matrixObject = JSON.parse(matrix);
       if (json.isObject(matrixObject)) {
-        for (const matrixKey of Object.keys(matrixObject as object).sort())
+        for (const matrixKey of Object.keys(matrixObject).sort())
           suffix += `-${matrixObject[matrixKey]}`;
       } else {
         core.warning("User-specified `matrix` input is not an object.");
@@ -397,7 +397,7 @@ async function createPartialDatabaseBundle(
     await fs.promises.rm(databaseBundlePath, { force: true });
   }
   const output = fs.createWriteStream(databaseBundlePath);
-  const zip = archiver("zip");
+  const zip = new ZipArchive();
 
   zip.on("error", (err) => {
     throw err;

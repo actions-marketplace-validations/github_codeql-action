@@ -33,7 +33,6 @@ test.serial(
 
       const actualRef = await gitUtils.getRef();
       t.deepEqual(actualRef, expectedRef);
-      callback.restore();
     });
   },
 );
@@ -54,7 +53,6 @@ test.serial(
 
       const actualRef = await gitUtils.getRef();
       t.deepEqual(actualRef, expectedRef);
-      callback.restore();
     });
   },
 );
@@ -73,7 +71,6 @@ test.serial(
 
       const actualRef = await gitUtils.getRef();
       t.deepEqual(actualRef, "refs/pull/1/head");
-      callback.restore();
     });
   },
 );
@@ -100,8 +97,6 @@ test.serial(
 
       const actualRef = await gitUtils.getRef();
       t.deepEqual(actualRef, "refs/pull/2/merge");
-      callback.restore();
-      getAdditionalInputStub.restore();
     });
   },
 );
@@ -161,7 +156,6 @@ test.serial(
             "Both 'ref' and 'sha' are required if one of them is provided.",
         },
       );
-      getAdditionalInputStub.restore();
     });
   },
 );
@@ -188,7 +182,6 @@ test.serial(
             "Both 'ref' and 'sha' are required if one of them is provided.",
         },
       );
-      getAdditionalInputStub.restore();
     });
   },
 );
@@ -242,7 +235,6 @@ test.serial("isAnalyzingDefaultBranch()", async (t) => {
     process.env["GITHUB_EVENT_NAME"] = "schedule";
     process.env["GITHUB_REF"] = "refs/heads/main";
     t.deepEqual(await gitUtils.isAnalyzingDefaultBranch(), false);
-    getAdditionalInputStub.restore();
   });
 });
 
@@ -254,8 +246,6 @@ test.serial("determineBaseBranchHeadCommitOid non-pullrequest", async (t) => {
   const result = await gitUtils.determineBaseBranchHeadCommitOid(__dirname);
   t.deepEqual(result, undefined);
   t.deepEqual(0, infoStub.callCount);
-
-  infoStub.restore();
 });
 
 test.serial(
@@ -276,8 +266,6 @@ test.serial(
       "git call failed. Will calculate the base branch SHA on the server. Error: " +
         "The checkout path provided to the action does not appear to be a git repository.",
     );
-
-    infoStub.restore();
   },
 );
 
@@ -301,9 +289,26 @@ test.serial("determineBaseBranchHeadCommitOid other error", async (t) => {
       "The checkout path provided to the action does not appear to be a git repository.",
     ),
   );
-
-  infoStub.restore();
 });
+
+test.serial(
+  "determineBaseBranchHeadCommitOid accepts SHA-256 OIDs",
+  async (t) => {
+    const mergeSha = "a".repeat(64);
+    const baseOid = "b".repeat(64);
+    const headOid = "c".repeat(64);
+
+    process.env["GITHUB_EVENT_NAME"] = "pull_request";
+    process.env["GITHUB_SHA"] = mergeSha;
+
+    sinon
+      .stub(gitUtils as any, "runGitCommand")
+      .resolves(`commit ${mergeSha}\nparent ${baseOid}\nparent ${headOid}\n`);
+
+    const result = await gitUtils.determineBaseBranchHeadCommitOid(__dirname);
+    t.deepEqual(result, baseOid);
+  },
+);
 
 test.serial("decodeGitFilePath unquoted strings", async (t) => {
   t.deepEqual(gitUtils.decodeGitFilePath("foo"), "foo");
@@ -343,75 +348,200 @@ test.serial("decodeGitFilePath quoted strings", async (t) => {
   );
 });
 
-test.serial("getFileOidsUnderPath returns correct file mapping", async (t) => {
-  const runGitCommandStub = sinon
-    .stub(gitUtils as any, "runGitCommand")
-    .resolves(
-      "30d998ded095371488be3a729eb61d86ed721a18_lib/git-utils.js\n" +
-        "d89514599a9a99f22b4085766d40af7b99974827_lib/git-utils.js.map\n" +
-        "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96_src/git-utils.ts",
-    );
+test.serial(
+  "getFileOidsUnderPath uses --recurse-submodules when submodules exist",
+  async (t) => {
+    await withTmpDir(async (tmpDir) => {
+      fs.writeFileSync(path.join(tmpDir, ".gitmodules"), "");
+      const runGitCommandStub = sinon
+        .stub(gitUtils as any, "runGitCommand")
+        .callsFake(async (_cwd: any, args: any) => {
+          if (args[0] === "rev-parse") {
+            return `${tmpDir}\n`;
+          }
+          return (
+            "100644 30d998ded095371488be3a729eb61d86ed721a18 0\tlib/git-utils.js\n" +
+            "100644 d89514599a9a99f22b4085766d40af7b99974827 0\tlib/git-utils.js.map\n" +
+            "100644 a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96 0\tsrc/git-utils.ts"
+          );
+        });
 
-  const result = await gitUtils.getFileOidsUnderPath("/fake/path");
+      const result = await gitUtils.getFileOidsUnderPath("/fake/path");
 
-  t.deepEqual(result, {
-    "lib/git-utils.js": "30d998ded095371488be3a729eb61d86ed721a18",
-    "lib/git-utils.js.map": "d89514599a9a99f22b4085766d40af7b99974827",
-    "src/git-utils.ts": "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96",
-  });
+      t.deepEqual(result, {
+        "lib/git-utils.js": "30d998ded095371488be3a729eb61d86ed721a18",
+        "lib/git-utils.js.map": "d89514599a9a99f22b4085766d40af7b99974827",
+        "src/git-utils.ts": "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96",
+      });
 
-  t.deepEqual(runGitCommandStub.firstCall.args, [
-    "/fake/path",
-    ["ls-files", "--recurse-submodules", "--format=%(objectname)_%(path)"],
-    "Cannot list Git OIDs of tracked files.",
-  ]);
-});
+      // Second call (after getGitRoot) should include --recurse-submodules
+      t.deepEqual(runGitCommandStub.secondCall.args[1], [
+        "ls-files",
+        "--recurse-submodules",
+        "--stage",
+      ]);
+    });
+  },
+);
+
+test.serial(
+  "getFileOidsUnderPath omits --recurse-submodules when no submodules exist",
+  async (t) => {
+    await withTmpDir(async (tmpDir) => {
+      const runGitCommandStub = sinon
+        .stub(gitUtils as any, "runGitCommand")
+        .callsFake(async (_cwd: any, args: any) => {
+          if (args[0] === "rev-parse") {
+            return `${tmpDir}\n`;
+          }
+          return (
+            "100644 30d998ded095371488be3a729eb61d86ed721a18 0\tlib/git-utils.js\n" +
+            "100644 a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96 0\tsrc/git-utils.ts"
+          );
+        });
+
+      const result = await gitUtils.getFileOidsUnderPath("/fake/path");
+
+      t.deepEqual(result, {
+        "lib/git-utils.js": "30d998ded095371488be3a729eb61d86ed721a18",
+        "src/git-utils.ts": "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96",
+      });
+
+      // Second call (after getGitRoot) should NOT include --recurse-submodules
+      t.deepEqual(runGitCommandStub.secondCall.args[1], [
+        "ls-files",
+        "--stage",
+      ]);
+    });
+  },
+);
 
 test.serial("getFileOidsUnderPath handles quoted paths", async (t) => {
-  sinon
-    .stub(gitUtils as any, "runGitCommand")
-    .resolves(
-      "30d998ded095371488be3a729eb61d86ed721a18_lib/normal-file.js\n" +
-        'd89514599a9a99f22b4085766d40af7b99974827_"lib/file with spaces.js"\n' +
-        'a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96_"lib/file\\twith\\ttabs.js"',
-    );
+  await withTmpDir(async (tmpDir) => {
+    sinon
+      .stub(gitUtils as any, "runGitCommand")
+      .callsFake(async (_cwd: any, args: any) => {
+        if (args[0] === "rev-parse") {
+          return `${tmpDir}\n`;
+        }
+        return (
+          "100644 30d998ded095371488be3a729eb61d86ed721a18 0\tlib/normal-file.js\n" +
+          '100644 d89514599a9a99f22b4085766d40af7b99974827 0\t"lib/file with spaces.js"\n' +
+          '100644 a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96 0\t"lib/file\\twith\\ttabs.js"'
+        );
+      });
 
-  const result = await gitUtils.getFileOidsUnderPath("/fake/path");
+    const result = await gitUtils.getFileOidsUnderPath("/fake/path");
 
-  t.deepEqual(result, {
-    "lib/normal-file.js": "30d998ded095371488be3a729eb61d86ed721a18",
-    "lib/file with spaces.js": "d89514599a9a99f22b4085766d40af7b99974827",
-    "lib/file\twith\ttabs.js": "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96",
+    t.deepEqual(result, {
+      "lib/normal-file.js": "30d998ded095371488be3a729eb61d86ed721a18",
+      "lib/file with spaces.js": "d89514599a9a99f22b4085766d40af7b99974827",
+      "lib/file\twith\ttabs.js": "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96",
+    });
   });
 });
 
-test.serial("getFileOidsUnderPath handles empty output", async (t) => {
-  sinon.stub(gitUtils as any, "runGitCommand").resolves("");
+test.serial("getFileOidsUnderPath handles SHA-256 OIDs", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const sha256OidA =
+      "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2c0d4b7e8f9a1234567890ab";
+    const sha256OidB =
+      "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
 
-  const result = await gitUtils.getFileOidsUnderPath("/fake/path");
-  t.deepEqual(result, {});
+    sinon
+      .stub(gitUtils as any, "runGitCommand")
+      .callsFake(async (_cwd: any, args: any) => {
+        if (args[0] === "rev-parse") {
+          return `${tmpDir}\n`;
+        }
+        return (
+          `100644 ${sha256OidA} 0\tlib/sha256-file-a.js\n` +
+          `100644 ${sha256OidB} 0\tsrc/sha256-file-b.ts`
+        );
+      });
+
+    const result = await gitUtils.getFileOidsUnderPath("/fake/path");
+
+    t.deepEqual(result, {
+      "lib/sha256-file-a.js": sha256OidA,
+      "src/sha256-file-b.ts": sha256OidB,
+    });
+  });
+});
+
+test.serial(
+  "getFileOidsUnderPath rejects OIDs of unsupported length",
+  async (t) => {
+    await withTmpDir(async (tmpDir) => {
+      // 50-char OID: not a valid SHA-1 (40) or SHA-256 (64) length. The regex
+      // must not accept this even though every character is a valid hex digit.
+      const invalidLine =
+        "100644 30d998ded095371488be3a729eb61d86ed721a1830d998ded0 0\tlib/bad.js";
+      sinon
+        .stub(gitUtils as any, "runGitCommand")
+        .callsFake(async (_cwd: any, args: any) => {
+          if (args[0] === "rev-parse") {
+            return `${tmpDir}\n`;
+          }
+          return invalidLine;
+        });
+
+      await t.throwsAsync(
+        async () => {
+          await gitUtils.getFileOidsUnderPath("/fake/path");
+        },
+        {
+          instanceOf: Error,
+          message: `Unexpected "git ls-files" output: ${invalidLine}`,
+        },
+      );
+    });
+  },
+);
+
+test.serial("getFileOidsUnderPath handles empty output", async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    sinon
+      .stub(gitUtils as any, "runGitCommand")
+      .callsFake(async (_cwd: any, args: any) => {
+        if (args[0] === "rev-parse") {
+          return `${tmpDir}\n`;
+        }
+        return "";
+      });
+
+    const result = await gitUtils.getFileOidsUnderPath("/fake/path");
+    t.deepEqual(result, {});
+  });
 });
 
 test.serial(
   "getFileOidsUnderPath throws on unexpected output format",
   async (t) => {
-    sinon
-      .stub(gitUtils as any, "runGitCommand")
-      .resolves(
-        "30d998ded095371488be3a729eb61d86ed721a18_lib/git-utils.js\n" +
-          "invalid-line-format\n" +
-          "a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96_src/git-utils.ts",
-      );
+    await withTmpDir(async (tmpDir) => {
+      sinon
+        .stub(gitUtils as any, "runGitCommand")
+        .callsFake(async (_cwd: any, args: any) => {
+          if (args[0] === "rev-parse") {
+            return `${tmpDir}\n`;
+          }
+          return (
+            "100644 30d998ded095371488be3a729eb61d86ed721a18 0\tlib/git-utils.js\n" +
+            "invalid-line-format\n" +
+            "100644 a47c11f5bfdca7661942d2c8f1b7209fb0dfdf96 0\tsrc/git-utils.ts"
+          );
+        });
 
-    await t.throwsAsync(
-      async () => {
-        await gitUtils.getFileOidsUnderPath("/fake/path");
-      },
-      {
-        instanceOf: Error,
-        message: 'Unexpected "git ls-files" output: invalid-line-format',
-      },
-    );
+      await t.throwsAsync(
+        async () => {
+          await gitUtils.getFileOidsUnderPath("/fake/path");
+        },
+        {
+          instanceOf: Error,
+          message: 'Unexpected "git ls-files" output: invalid-line-format',
+        },
+      );
+    });
   },
 );
 

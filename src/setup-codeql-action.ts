@@ -1,18 +1,22 @@
 import * as core from "@actions/core";
-import { v4 as uuidV4 } from "uuid";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import {
   getActionVersion,
   getOptionalInput,
   getRequiredInput,
   getTemporaryDirectory,
 } from "./actions-util";
+import { AnalysisKind, getAnalysisKinds } from "./analyses";
 import { getGitHubVersion } from "./api-client";
 import { CodeQL } from "./codeql";
+import { ComputedInput, getToolsInput } from "./config/inputs";
+import { getRawLanguagesNoAutodetect } from "./config-utils";
 import { EnvVar } from "./environment";
 import { initFeatures } from "./feature-flags";
+import { loadRepositoryProperties } from "./feature-flags/properties";
 import { initCodeQL } from "./init";
-import { getActionsLogger, Logger } from "./logging";
+import { Logger } from "./logging";
 import { getRepositoryNwo } from "./repository";
 import { ToolsSource } from "./setup-codeql";
 import {
@@ -22,7 +26,6 @@ import {
   createStatusReportBase,
   getActionsStatus,
   sendStatusReport,
-  sendUnhandledErrorStatusReport,
 } from "./status-report";
 import { ToolsDownloadStatusReport } from "./tools-download";
 import {
@@ -34,7 +37,6 @@ import {
   ConfigurationError,
   wrapError,
   checkActionVersion,
-  getErrorMessage,
 } from "./util";
 
 /**
@@ -42,6 +44,7 @@ import {
  */
 async function sendCompletedStatusReport(
   startedAt: Date,
+  toolsInput: ComputedInput | undefined,
   toolsDownloadStatusReport: ToolsDownloadStatusReport | undefined,
   toolsFeatureFlagsValid: boolean | undefined,
   toolsSource: ToolsSource,
@@ -66,11 +69,15 @@ async function sendCompletedStatusReport(
 
   const initStatusReport: InitStatusReport = {
     ...statusReportBase,
-    tools_input: getOptionalInput("tools") || "",
+    tools_input: toolsInput?.value || "",
     tools_resolved_version: toolsVersion,
     tools_source: toolsSource || ToolsSource.Unknown,
     workflow_languages: "",
   };
+
+  if (toolsInput !== undefined) {
+    initStatusReport.computed_inputs.tools = toolsInput;
+  }
 
   const initToolsDownloadFields: InitToolsDownloadFields = {};
 
@@ -86,13 +93,15 @@ async function sendCompletedStatusReport(
 }
 
 /** The main behaviour of this action. */
-async function run(startedAt: Date): Promise<void> {
+async function run(
+  actionState: ActionState<["Base", "Logger", "Env", "Actions"]>,
+): Promise<void> {
   // To capture errors appropriately, keep as much code within the try-catch as
   // possible, and only use safe functions outside.
-
-  const logger = getActionsLogger();
+  const { logger, startedAt } = actionState;
 
   let codeql: CodeQL;
+  let toolsInput: ComputedInput | undefined;
   let toolsDownloadStatusReport: ToolsDownloadStatusReport | undefined;
   let toolsFeatureFlagsValid: boolean | undefined;
   let toolsSource: ToolsSource;
@@ -121,9 +130,14 @@ async function run(startedAt: Date): Promise<void> {
       logger,
     );
 
-    const jobRunUuid = uuidV4();
-    logger.info(`Job run UUID is ${jobRunUuid}.`);
-    core.exportVariable(EnvVar.JOB_RUN_UUID, jobRunUuid);
+    // Fetch the values of known repository properties that affect us.
+    const repositoryPropertiesResult = await loadRepositoryProperties(
+      repositoryNwo,
+      logger,
+    );
+    const repositoryProperties = repositoryPropertiesResult.orElse({});
+
+    const actionStateWithFeatures = { ...actionState, features };
 
     const statusReportBase = await createStatusReportBase(
       ActionName.SetupCodeQL,
@@ -136,16 +150,29 @@ async function run(startedAt: Date): Promise<void> {
     if (statusReportBase !== undefined) {
       await sendStatusReport(statusReportBase);
     }
-    const codeQLDefaultVersionInfo = await features.getDefaultCliVersion(
-      gitHubVersion.type,
+
+    // Get the computed `tools` input.
+    toolsInput = await getToolsInput(
+      actionStateWithFeatures,
+      repositoryProperties,
     );
+
+    const codeQLDefaultVersionInfo =
+      await features.getEnabledDefaultCliVersions(gitHubVersion.type);
     toolsFeatureFlagsValid = codeQLDefaultVersionInfo.toolsFeatureFlagsValid;
+    const rawLanguages = getRawLanguagesNoAutodetect(
+      getOptionalInput("languages"),
+    );
+    const analysisKinds = await getAnalysisKinds(logger, features);
     const initCodeQLResult = await initCodeQL(
-      getOptionalInput("tools"),
+      toolsInput?.value,
       apiDetails,
       getTemporaryDirectory(),
       gitHubVersion.type,
       codeQLDefaultVersionInfo,
+      rawLanguages,
+      analysisKinds.length === 1 &&
+        analysisKinds[0] === AnalysisKind.CodeScanning,
       features,
       logger,
     );
@@ -179,6 +206,7 @@ async function run(startedAt: Date): Promise<void> {
 
   await sendCompletedStatusReport(
     startedAt,
+    toolsInput,
     toolsDownloadStatusReport,
     toolsFeatureFlagsValid,
     toolsSource,
@@ -187,22 +215,14 @@ async function run(startedAt: Date): Promise<void> {
   );
 }
 
+/** Defines the `setup-codeql` Action. */
+const setupCodeQL: Action = {
+  name: ActionName.SetupCodeQL,
+  run,
+};
+
 /** Run the action and catch any unhandled errors. */
-async function runWrapper(): Promise<void> {
-  const startedAt = new Date();
-  const logger = getActionsLogger();
-  try {
-    await run(startedAt);
-  } catch (error) {
-    core.setFailed(`setup-codeql action failed: ${getErrorMessage(error)}`);
-    await sendUnhandledErrorStatusReport(
-      ActionName.SetupCodeQL,
-      startedAt,
-      error,
-      logger,
-    );
-  }
+export async function runWrapper(): Promise<void> {
+  await runInActions(setupCodeQL);
   await checkForTimeout();
 }
-
-void runWrapper();

@@ -5,10 +5,12 @@ import { performance } from "perf_hooks";
 import * as core from "@actions/core";
 import * as yaml from "js-yaml";
 
+import { ActionState } from "./action-common";
 import {
   getActionVersion,
   getOptionalInput,
   isAnalyzingPullRequest,
+  isDefaultSetup,
   isDynamicWorkflow,
 } from "./actions-util";
 import {
@@ -18,23 +20,35 @@ import {
   getAnalysisConfig,
 } from "./analyses";
 import * as api from "./api-client";
-import { CachingKind, getCachingKind } from "./caching-utils";
+import { getCachingKind } from "./caching-utils";
 import { type CodeQL } from "./codeql";
+import { type Config } from "./config/action-config";
 import {
   calculateAugmentation,
   ExcludeQueryFilter,
   generateCodeScanningConfig,
+  mergeDefaultSetupAndUserConfigs,
   parseUserConfig,
   UserConfig,
 } from "./config/db-config";
 import {
+  getRemoteConfig,
+  LOCAL_PATH_PREFIX,
+  REMOTE_PATH_PREFIX,
+} from "./config/file";
+import {
+  parseRegistries,
+  type RegistryConfigNoCredentials,
+  type RegistryConfigWithCredentials,
+} from "./config/pack-registries";
+import {
   addNoLanguageDiagnostic,
   makeTelemetryDiagnostic,
 } from "./diagnostics";
-import { shouldPerformDiffInformedAnalysis } from "./diff-informed-analysis-utils";
+import { prepareDiffInformedAnalysis } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
 import * as errorMessages from "./error-messages";
-import { Feature, FeatureEnablement } from "./feature-flags";
+import { Feature, FeatureEnablement, FeatureWithoutCLI } from "./feature-flags";
 import {
   RepositoryProperties,
   RepositoryPropertyName,
@@ -43,17 +57,19 @@ import {
   getGeneratedFiles,
   getGitRoot,
   getGitVersionOrThrow,
-  GIT_MINIMUM_VERSION_FOR_OVERLAY,
+  GIT_MINIMUM_VERSION_FOR_OVERLAY_WITH_SUBMODULES,
   GitVersionInfo,
+  hasSubmodules,
   isAnalyzingDefaultBranch,
 } from "./git-utils";
-import { KnownLanguage, Language } from "./languages";
+import { BuiltInLanguage, Language } from "./languages";
 import { Logger } from "./logging";
-import { CODEQL_OVERLAY_MINIMUM_VERSION, OverlayDatabaseMode } from "./overlay";
+import { CODEQL_OVERLAY_MINIMUM_VERSION } from "./overlay";
 import {
   addOverlayDisablementDiagnostics,
   OverlayDisabledReason,
 } from "./overlay/diagnostics";
+import { OverlayDatabaseMode } from "./overlay/overlay-database-mode";
 import { shouldSkipOverlayAnalysis } from "./overlay/status";
 import { RepositoryNwo } from "./repository";
 import { ToolsFeature } from "./tools-features";
@@ -77,25 +93,31 @@ import {
   isHostedRunner,
 } from "./util";
 
+export { type Config } from "./config/action-config";
+
 /**
  * The minimum available disk space (in MB) required to perform overlay analysis.
  * If the available disk space on the runner is below the threshold when deciding
  * whether to perform overlay analysis, then the action will not perform overlay
  * analysis unless overlay analysis has been explicitly enabled via environment
  * variable.
+ *
+ * This threshold can be lowered by the feature flags in
+ * `OVERLAY_MINIMUM_DISK_SPACE_MB_BY_FEATURE`.
  */
-const OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_MB = 20000;
-const OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_BYTES =
-  OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_MB * 1_000_000;
+const OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_MB = 14000;
 
 /**
- * The v2 minimum available disk space (in MB) required to perform overlay
- * analysis. This is a lower threshold than the v1 limit, allowing overlay
- * analysis to run on runners with less available disk space.
+ * Minimum available disk space (in MB) enabled by each overlay feature flag.
  */
-const OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_V2_MB = 14000;
-const OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_V2_BYTES =
-  OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_V2_MB * 1_000_000;
+const OVERLAY_MINIMUM_DISK_SPACE_MB_BY_FEATURE = {
+  [Feature.OverlayAnalysisMinDisk8Gb]: 8000,
+  [Feature.OverlayAnalysisMinDisk9Gb]: 9000,
+  [Feature.OverlayAnalysisMinDisk10Gb]: 10000,
+  [Feature.OverlayAnalysisMinDisk11Gb]: 11000,
+  [Feature.OverlayAnalysisMinDisk12Gb]: 12000,
+  [Feature.OverlayAnalysisMinDisk13Gb]: 13000,
+} satisfies Partial<Record<FeatureWithoutCLI, number>>;
 
 /**
  * The minimum memory (in MB) that must be available for CodeQL to perform overlay analysis. If
@@ -115,143 +137,6 @@ const OVERLAY_MINIMUM_MEMORY_MB = 5 * 1024;
  */
 const CODEQL_VERSION_REDUCED_OVERLAY_MEMORY_USAGE = "2.24.3";
 
-export type RegistryConfigWithCredentials = RegistryConfigNoCredentials & {
-  // Token to use when downloading packs from this registry.
-  token: string;
-};
-
-/**
- * The list of registries and the associated pack globs that determine where each
- * pack can be downloaded from.
- */
-export interface RegistryConfigNoCredentials {
-  // URL of a package registry, eg- https://ghcr.io/v2/
-  url: string;
-
-  // List of globs that determine which packs are associated with this registry.
-  packages: string[] | string;
-
-  // Kind of registry, either "github" or "docker". Default is "docker".
-  // "docker" refers specifically to the GitHub Container Registry, which is the usual way of sharing CodeQL packs.
-  // "github" refers to packs published as content in a GitHub repository. This kind of registry is used in scenarios
-  // where GHCR is not available, such as certain GHES environments.
-  kind?: "github" | "docker";
-}
-
-/**
- * Format of the parsed config file.
- */
-export interface Config {
-  /**
-   * The version of the CodeQL Action that the configuration is for.
-   */
-  version: string;
-  /**
-   * Set of analysis kinds that are enabled.
-   */
-  analysisKinds: AnalysisKind[];
-  /**
-   * Set of languages to run analysis for.
-   */
-  languages: Language[];
-  /**
-   * Build mode, if set. Currently only a single build mode is supported per job.
-   */
-  buildMode: BuildMode | undefined;
-  /**
-   * A unaltered copy of the original user input.
-   * Mainly intended to be used for status reporting.
-   * If any field is useful for the actual processing
-   * of the action then consider pulling it out to a
-   * top-level field above.
-   */
-  originalUserInput: UserConfig;
-  /**
-   * Directory to use for temporary files that should be
-   * deleted at the end of the job.
-   */
-  tempDir: string;
-  /**
-   * Path of the CodeQL executable.
-   */
-  codeQLCmd: string;
-  /**
-   * Version of GitHub we are talking to.
-   */
-  gitHubVersion: GitHubVersion;
-  /**
-   * The location where CodeQL databases should be stored.
-   */
-  dbLocation: string;
-  /**
-   * Specifies whether we are debugging mode and should try to produce extra
-   * output for debugging purposes when possible.
-   */
-  debugMode: boolean;
-  /**
-   * Specifies the name of the debugging artifact if we are in debug mode.
-   */
-  debugArtifactName: string;
-  /**
-   * Specifies the name of the database in the debugging artifact.
-   */
-  debugDatabaseName: string;
-  /**
-   * The configuration we computed by combining `originalUserInput` with `augmentationProperties`,
-   * as well as adjustments made to it based on unsupported or required options.
-   */
-  computedConfig: UserConfig;
-
-  /**
-   * Partial map from languages to locations of TRAP caches for that language.
-   * If a key is omitted, then TRAP caching should not be used for that language.
-   */
-  trapCaches: { [language: Language]: string };
-
-  /**
-   * Time taken to download TRAP caches. Used for status reporting.
-   */
-  trapCacheDownloadTime: number;
-
-  /** A value indicating how dependency caching should be used. */
-  dependencyCachingEnabled: CachingKind;
-
-  /** The keys of caches that we restored, if any. */
-  dependencyCachingRestoredKeys: string[];
-
-  /**
-   * Extra query exclusions to append to the config.
-   */
-  extraQueryExclusions: ExcludeQueryFilter[];
-
-  /**
-   * The overlay database mode to use.
-   */
-  overlayDatabaseMode: OverlayDatabaseMode;
-
-  /**
-   * Whether to use caching for overlay databases. If it is true, the action
-   * will upload the created overlay-base database to the actions cache, and
-   * download an overlay-base database from the actions cache before it creates
-   * a new overlay database. If it is false, the action assumes that the
-   * workflow will be responsible for managing database storage and retrieval.
-   *
-   * This property has no effect unless `overlayDatabaseMode` is `Overlay` or
-   * `OverlayBase`.
-   */
-  useOverlayDatabaseCaching: boolean;
-
-  /**
-   * A partial mapping from repository properties that affect us to their values.
-   */
-  repositoryProperties: RepositoryProperties;
-
-  /**
-   * Whether to enable file coverage information.
-   */
-  enableFileCoverageInformation: boolean;
-}
-
 async function getSupportedLanguageMap(
   codeql: CodeQL,
   logger: Logger,
@@ -259,7 +144,7 @@ async function getSupportedLanguageMap(
   const resolveSupportedLanguagesUsingCli = await codeql.supportsFeature(
     ToolsFeature.BuiltinExtractorsSpecifyDefaultQueries,
   );
-  const resolveResult = await codeql.betterResolveLanguages({
+  const resolveResult = await codeql.resolveLanguages({
     filterToLanguagesWithQueries: resolveSupportedLanguagesUsingCli,
   });
   if (resolveSupportedLanguagesUsingCli) {
@@ -272,10 +157,10 @@ async function getSupportedLanguageMap(
   for (const extractor of Object.keys(resolveResult.extractors)) {
     // If the CLI supports resolving languages with default queries, use these
     // as the set of supported languages. Otherwise, require the language to be
-    // a known language.
+    // a built-in language.
     if (
       resolveSupportedLanguagesUsingCli ||
-      KnownLanguage[extractor] !== undefined
+      BuiltInLanguage[extractor] !== undefined
     ) {
       supportedLanguages[extractor] = extractor;
     }
@@ -405,6 +290,7 @@ export async function getLanguages(
   return languages;
 }
 
+/** Splits the `languages` input into a list of raw languages without checking if they are supported by CodeQL. */
 export function getRawLanguagesNoAutodetect(
   languagesInput: string | undefined,
 ): string[] {
@@ -570,6 +456,7 @@ export async function initActionState(
     extraQueryExclusions: [],
     overlayDatabaseMode: OverlayDatabaseMode.None,
     useOverlayDatabaseCaching: false,
+    overlayModeSetExplicitly: false,
     repositoryProperties,
     enableFileCoverageInformation,
   };
@@ -589,13 +476,22 @@ async function downloadCacheWithTime(
   return { trapCaches, trapCacheDownloadTime };
 }
 
-async function loadUserConfig(
-  logger: Logger,
+/**
+ * Loads a CLI configuration file from `configFile`.
+ *
+ * @param actionState The Action state.
+ * @param configFile The address of the configuration file.
+ * @param workspacePath The workspace path, used to check that the configuration file exists relative to it.
+ * @param apiDetails Information for how to access the API to fetch remote files.
+ * @param tempDir The temporary directory which may contain a CodeQL Action-generated configuration file.
+ * @returns The loaded configuration file, if successful.
+ */
+export async function loadUserConfig(
+  actionState: ActionState<["Logger", "Env", "FeatureFlags"]>,
   configFile: string,
   workspacePath: string,
   apiDetails: api.GitHubApiCombinedDetails,
   tempDir: string,
-  validateConfig: boolean,
 ): Promise<UserConfig> {
   if (isLocal(configFile)) {
     if (configFile !== userConfigFromActionPath(tempDir)) {
@@ -608,14 +504,18 @@ async function loadUserConfig(
         );
       }
     }
-    return getLocalConfig(logger, configFile, validateConfig);
-  } else {
-    return await getRemoteConfig(
-      logger,
-      configFile,
-      apiDetails,
-      validateConfig,
+    const validateConfig = await actionState.features.getValue(
+      Feature.ValidateDbConfig,
     );
+    return getLocalConfig(actionState.logger, configFile, validateConfig);
+  } else {
+    // Drop the explicit prefix if it is present. Since `REMOTE_PATH_PREFIX` is chosen
+    // to not conflict with permissible characters in "owner" or "repo" components,
+    // this does not risk removing valid parts of either component by accident.
+    if (isExplicitRemotePath(configFile)) {
+      configFile = configFile.substring(REMOTE_PATH_PREFIX.length);
+    }
+    return await getRemoteConfig(actionState, configFile, apiDetails);
   }
 }
 
@@ -692,24 +592,44 @@ async function checkOverlayAnalysisFeatureEnabled(
   return new Success(undefined);
 }
 
+/**
+ * Returns the minimum available disk space (in MB) required to perform overlay
+ * analysis, which is the lowest threshold enabled by a feature flag, or the
+ * default threshold if no such feature flag is enabled.
+ */
+async function getMinimumDiskSpaceMb(
+  features: FeatureEnablement,
+): Promise<number> {
+  let minimumMb = OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_MB;
+  for (const [feature, thresholdMb] of Object.entries(
+    OVERLAY_MINIMUM_DISK_SPACE_MB_BY_FEATURE,
+  )) {
+    if (await features.getValue(feature as FeatureWithoutCLI)) {
+      minimumMb = Math.min(minimumMb, thresholdMb);
+    }
+  }
+  return minimumMb;
+}
+
 /** Checks if the runner has enough disk space for overlay analysis. */
 function runnerHasSufficientDiskSpace(
   diskUsage: DiskUsage,
   logger: Logger,
-  useV2ResourceChecks: boolean,
+  minimumDiskSpaceMb: number,
 ): boolean {
-  const minimumDiskSpaceBytes = useV2ResourceChecks
-    ? OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_V2_BYTES
-    : OVERLAY_MINIMUM_AVAILABLE_DISK_SPACE_BYTES;
-  if (diskUsage.numAvailableBytes < minimumDiskSpaceBytes) {
-    const diskSpaceMb = Math.round(diskUsage.numAvailableBytes / 1_000_000);
-    const minimumDiskSpaceMb = Math.round(minimumDiskSpaceBytes / 1_000_000);
+  const diskSpaceMb = Math.round(diskUsage.numAvailableBytes / 1_000_000);
+  if (diskUsage.numAvailableBytes < minimumDiskSpaceMb * 1_000_000) {
     logger.info(
       `Setting overlay database mode to ${OverlayDatabaseMode.None} ` +
         `due to insufficient disk space (${diskSpaceMb} MB, needed ${minimumDiskSpaceMb} MB).`,
     );
     return false;
   }
+
+  logger.debug(
+    `Disk space available for CodeQL analysis is ${diskSpaceMb} MB, which is at or above the ` +
+      `minimum of ${minimumDiskSpaceMb} MB.`,
+  );
   return true;
 }
 
@@ -741,7 +661,7 @@ async function runnerHasSufficientMemory(
   }
 
   logger.debug(
-    `Memory available for CodeQL analysis is ${memoryFlagValue} MB, which is above the minimum of ${OVERLAY_MINIMUM_MEMORY_MB} MB.`,
+    `Memory available for CodeQL analysis is ${memoryFlagValue} MB, which is at or above the minimum of ${OVERLAY_MINIMUM_MEMORY_MB} MB.`,
   );
   return true;
 }
@@ -752,12 +672,13 @@ async function runnerHasSufficientMemory(
  */
 async function checkRunnerResources(
   codeql: CodeQL,
+  features: FeatureEnablement,
   diskUsage: DiskUsage,
   ramInput: string | undefined,
   logger: Logger,
-  useV2ResourceChecks: boolean,
 ): Promise<Result<void, OverlayDisabledReason>> {
-  if (!runnerHasSufficientDiskSpace(diskUsage, logger, useV2ResourceChecks)) {
+  const minimumDiskSpaceMb = await getMinimumDiskSpaceMb(features);
+  if (!runnerHasSufficientDiskSpace(diskUsage, logger, minimumDiskSpaceMb)) {
     return new Failure(OverlayDisabledReason.InsufficientDiskSpace);
   }
   if (!(await runnerHasSufficientMemory(codeql, ramInput, logger))) {
@@ -769,6 +690,7 @@ async function checkRunnerResources(
 interface EnabledOverlayConfig {
   overlayDatabaseMode: Exclude<OverlayDatabaseMode, OverlayDatabaseMode.None>;
   useOverlayDatabaseCaching: boolean;
+  overlayModeSetExplicitly: boolean;
 }
 
 /**
@@ -823,6 +745,7 @@ export async function checkOverlayEnablement(
     return validateOverlayDatabaseMode(
       modeEnv,
       false,
+      true,
       codeql,
       languages,
       sourceRoot,
@@ -854,9 +777,6 @@ export async function checkOverlayEnablement(
     Feature.OverlayAnalysisSkipResourceChecks,
     codeql,
   ));
-  const useV2ResourceChecks = await features.getValue(
-    Feature.OverlayAnalysisResourceChecksV2,
-  );
   const checkOverlayStatus = await features.getValue(
     Feature.OverlayAnalysisStatusCheck,
   );
@@ -872,10 +792,10 @@ export async function checkOverlayEnablement(
     performResourceChecks && diskUsage !== undefined
       ? await checkRunnerResources(
           codeql,
+          features,
           diskUsage,
           ramInput,
           logger,
-          useV2ResourceChecks,
         )
       : new Success<void>(undefined);
   if (resourceResult.isFailure()) {
@@ -914,6 +834,7 @@ export async function checkOverlayEnablement(
   return validateOverlayDatabaseMode(
     overlayDatabaseMode,
     true,
+    false,
     codeql,
     languages,
     sourceRoot,
@@ -932,6 +853,7 @@ export async function checkOverlayEnablement(
 async function validateOverlayDatabaseMode(
   overlayDatabaseMode: Exclude<OverlayDatabaseMode, OverlayDatabaseMode.None>,
   useOverlayDatabaseCaching: boolean,
+  overlayModeSetExplicitly: boolean,
   codeql: CodeQL,
   languages: Language[],
   sourceRoot: string,
@@ -945,7 +867,7 @@ async function validateOverlayDatabaseMode(
       await Promise.all(
         languages.map(
           async (l) =>
-            l !== KnownLanguage.go && // Workaround to allow overlay analysis for Go with any build
+            l !== BuiltInLanguage.go && // Workaround to allow overlay analysis for Go with any build
             // mode, since it does not yet support BMN. The Go autobuilder and/or extractor will
             // ensure that overlay-base databases are only created for supported Go build setups,
             // and that we'll fall back to full databases in other cases.
@@ -969,7 +891,8 @@ async function validateOverlayDatabaseMode(
     );
     return new Failure(OverlayDisabledReason.IncompatibleCodeQl);
   }
-  if ((await getGitRoot(sourceRoot)) === undefined) {
+  const gitRoot = await getGitRoot(sourceRoot);
+  if (gitRoot === undefined) {
     logger.warning(
       `Cannot build an ${overlayDatabaseMode} database because ` +
         `the source root "${sourceRoot}" is not inside a git repository. ` +
@@ -977,26 +900,32 @@ async function validateOverlayDatabaseMode(
     );
     return new Failure(OverlayDisabledReason.NoGitRoot);
   }
-  if (gitVersion === undefined) {
-    logger.warning(
-      `Cannot build an ${overlayDatabaseMode} database because ` +
-        "the Git version could not be determined. " +
-        "Falling back to creating a normal full database instead.",
-    );
-    return new Failure(OverlayDisabledReason.IncompatibleGit);
-  }
-  if (!gitVersion.isAtLeast(GIT_MINIMUM_VERSION_FOR_OVERLAY)) {
-    logger.warning(
-      `Cannot build an ${overlayDatabaseMode} database because ` +
-        `the installed Git version is older than ${GIT_MINIMUM_VERSION_FOR_OVERLAY}. ` +
-        "Falling back to creating a normal full database instead.",
-    );
-    return new Failure(OverlayDisabledReason.IncompatibleGit);
+  if (hasSubmodules(gitRoot)) {
+    if (gitVersion === undefined) {
+      logger.warning(
+        `Cannot build an ${overlayDatabaseMode} database because ` +
+          "the repository has submodules and the Git version could not be determined. " +
+          "Falling back to creating a normal full database instead.",
+      );
+      return new Failure(OverlayDisabledReason.IncompatibleGit);
+    }
+    if (
+      !gitVersion.isAtLeast(GIT_MINIMUM_VERSION_FOR_OVERLAY_WITH_SUBMODULES)
+    ) {
+      logger.warning(
+        `Cannot build an ${overlayDatabaseMode} database because ` +
+          "the repository has submodules and the installed Git version is older " +
+          `than ${GIT_MINIMUM_VERSION_FOR_OVERLAY_WITH_SUBMODULES}. ` +
+          "Falling back to creating a normal full database instead.",
+      );
+      return new Failure(OverlayDisabledReason.IncompatibleGit);
+    }
   }
 
   return new Success({
     overlayDatabaseMode,
     useOverlayDatabaseCaching,
+    overlayModeSetExplicitly,
   });
 }
 
@@ -1028,13 +957,13 @@ async function setCppTrapCachingEnvironmentVariables(
   config: Config,
   logger: Logger,
 ): Promise<void> {
-  if (config.languages.includes(KnownLanguage.cpp)) {
+  if (config.languages.includes(BuiltInLanguage.cpp)) {
     const envVar = "CODEQL_EXTRACTOR_CPP_TRAP_CACHING";
     if (process.env[envVar]) {
       logger.info(
         `Environment variable ${envVar} already set, leaving it unchanged.`,
       );
-    } else if (config.trapCaches[KnownLanguage.cpp]) {
+    } else if (config.trapCaches[BuiltInLanguage.cpp]) {
       logger.info("Enabling TRAP caching for C/C++.");
       core.exportVariable(envVar, "true");
     } else {
@@ -1051,7 +980,11 @@ function dbLocationOrDefault(
   return dbLocation || path.resolve(tempDir, "codeql_databases");
 }
 
-function userConfigFromActionPath(tempDir: string): string {
+/**
+ * Gets the path for the CodeQL Action-generated configuration file,
+ * which is used to store the `config` input.
+ */
+export function userConfigFromActionPath(tempDir: string): string {
   return path.resolve(tempDir, "user-config-from-action.yml");
 }
 
@@ -1069,44 +1002,166 @@ function hasQueryCustomisation(userConfig: UserConfig): boolean {
 }
 
 /**
+ * Finalize the incremental-analysis configuration for this run.
+ *
+ * Overlay analysis has only been validated in combination with diff-informed analysis, so if
+ * `Overlay` mode was selected for a pull request but the diff ranges could not be computed, fall
+ * back to a full non-overlay analysis. If the overlay mode was set explicitly, this fallback does
+ * not apply.
+ *
+ * Query exclusions for incremental-only queries are then applied whenever the diff ranges are
+ * available — which, after the fallback above, is exactly the set of runs where any kind of
+ * incremental analysis (overlay or diff-informed) is in effect.
+ */
+export async function applyIncrementalAnalysisSettings(
+  config: Config,
+  hasDiffRanges: boolean,
+  codeql: CodeQL,
+  logger: Logger,
+): Promise<void> {
+  if (
+    config.overlayDatabaseMode === OverlayDatabaseMode.Overlay &&
+    !hasDiffRanges &&
+    !config.overlayModeSetExplicitly
+  ) {
+    logger.info(
+      `Reverting overlay database mode to ${OverlayDatabaseMode.None} ` +
+        "because the PR diff ranges could not be computed.",
+    );
+    config.overlayDatabaseMode = OverlayDatabaseMode.None;
+    config.useOverlayDatabaseCaching = false;
+    await addOverlayDisablementDiagnostics(
+      config,
+      codeql,
+      OverlayDisabledReason.DiffInformedAnalysisNotEnabled,
+    );
+  }
+
+  if (hasDiffRanges) {
+    config.extraQueryExclusions.push({
+      exclude: { tags: "exclude-from-incremental" },
+    });
+  }
+}
+
+/**
+ * Determines where to load the `UserConfig` for the CLI from and loads it.
+ *
+ * @param inputs The Action inputs. The `configFile` value will be mutated
+ *               if a CodeQL Action-generated file should be used.
+ *
+ * @returns The loaded `UserConfig`, which might be empty if no configuration
+ *          was specified.
+ */
+export async function determineUserConfig(
+  action: ActionState<["Logger", "Env", "FeatureFlags"]>,
+  tempDir: string,
+  inputs: InitConfigInputs,
+): Promise<UserConfig> {
+  const validateConfig = await action.features.getValue(
+    Feature.ValidateDbConfig,
+  );
+
+  // We have the following cases:
+  // 1. A `config` or `config-file` input is provided, but not both: use the provided one.
+  // 2. Both are provided and we are in an advanced workflow: ignore the `config-file` input.
+  // 3. Both are provided and we are in Default Setup: the `config` input uses a limited
+  //    set of options, which are supported by `mergeDefaultSetupAndUserConfigs`,
+  //    and we merge the two configs.
+  if (inputs.configInput) {
+    const computedConfigPath = userConfigFromActionPath(tempDir);
+
+    // Get a function which enables us to determine whether the FF that allows us to
+    // merge supported configuration file properties is enabled. We only execute
+    // this lazily if the other checks pass.
+    const allowMergeConfigs = () =>
+      action.features.getValue(Feature.AllowMergeConfigFiles);
+
+    // Check whether we also have a `config-file` input and decide what to do.
+    if (
+      inputs.configFile &&
+      isDefaultSetup(action.env) &&
+      (await allowMergeConfigs())
+    ) {
+      // If the FF is enabled and we are in Default Setup, combine the supported
+      // configuration file properties and write the result to disk.
+      const fromConfigInput = parseUserConfig(
+        action.logger,
+        "`config` input",
+        inputs.configInput,
+        validateConfig,
+      );
+      const fromConfigFile = await loadUserConfig(
+        action,
+        inputs.configFile,
+        inputs.workspacePath,
+        inputs.apiDetails,
+        tempDir,
+      );
+
+      // Write the merged configuration to disk so that it can be loaded subsequently by
+      // the CLI or other CodeQL Action steps.
+      const mergedConfig = mergeDefaultSetupAndUserConfigs(
+        action.logger,
+        fromConfigInput,
+        fromConfigFile,
+      );
+      fs.writeFileSync(computedConfigPath, yaml.dump(mergedConfig));
+      action.logger.debug(
+        `Using merged configurations from 'config' input with configuration from '${inputs.configFile}': ${computedConfigPath}`,
+      );
+
+      inputs.configFile = computedConfigPath;
+      return mergedConfig;
+    } else {
+      // If we are in this branch and there is a `config-file` input, then it means
+      // we didn't meet the conditions for merging the configurations. Warn the user
+      // that the configuration file will be ignored.
+      if (inputs.configFile) {
+        action.logger.warning(
+          `Both a config file and config input were provided. Ignoring config file.`,
+        );
+      }
+
+      // Write the `config` input straight to disk.
+      fs.writeFileSync(computedConfigPath, inputs.configInput);
+      inputs.configFile = computedConfigPath;
+      action.logger.debug(
+        `Using config from action input: ${inputs.configFile}`,
+      );
+    }
+  }
+
+  // Load whatever configuration file we have, if any.
+  if (!inputs.configFile) {
+    action.logger.debug("No configuration file was provided");
+    return {};
+  } else {
+    action.logger.debug(`Using configuration file: ${inputs.configFile}`);
+    return await loadUserConfig(
+      action,
+      inputs.configFile,
+      inputs.workspacePath,
+      inputs.apiDetails,
+      tempDir,
+    );
+  }
+}
+
+/**
  * Load and return the config.
  *
  * This will parse the config from the user input if present, or generate
  * a default config. The parsed config is then stored to a known location.
  */
 export async function initConfig(
-  features: FeatureEnablement,
+  actionState: ActionState<["Logger", "Env", "FeatureFlags"]>,
   inputs: InitConfigInputs,
 ): Promise<Config> {
-  const { logger, tempDir } = inputs;
+  const { logger, features } = actionState;
+  const { tempDir } = inputs;
 
-  // if configInput is set, it takes precedence over configFile
-  if (inputs.configInput) {
-    if (inputs.configFile) {
-      logger.warning(
-        `Both a config file and config input were provided. Ignoring config file.`,
-      );
-    }
-    inputs.configFile = userConfigFromActionPath(tempDir);
-    fs.writeFileSync(inputs.configFile, inputs.configInput);
-    logger.debug(`Using config from action input: ${inputs.configFile}`);
-  }
-
-  let userConfig: UserConfig = {};
-  if (!inputs.configFile) {
-    logger.debug("No configuration file was provided");
-  } else {
-    logger.debug(`Using configuration file: ${inputs.configFile}`);
-    const validateConfig = await features.getValue(Feature.ValidateDbConfig);
-    userConfig = await loadUserConfig(
-      logger,
-      inputs.configFile,
-      inputs.workspacePath,
-      inputs.apiDetails,
-      tempDir,
-      validateConfig,
-    );
-  }
+  const userConfig = await determineUserConfig(actionState, tempDir, inputs);
 
   const config = await initActionState(inputs, userConfig);
 
@@ -1133,7 +1188,6 @@ export async function initConfig(
   try {
     gitVersion = await getGitVersionOrThrow();
     logger.info(`Using Git version ${gitVersion.fullVersion}`);
-    await logGitVersionTelemetry(config, gitVersion);
   } catch (e) {
     logger.warning(`Could not determine Git version: ${getErrorMessage(e)}`);
     // Throw the error in test mode so it's more visible, unless the environment
@@ -1200,14 +1254,18 @@ export async function initConfig(
     logger,
   );
   if (overlayDatabaseModeResult.isSuccess()) {
-    const { overlayDatabaseMode, useOverlayDatabaseCaching } =
-      overlayDatabaseModeResult.value;
+    const {
+      overlayDatabaseMode,
+      useOverlayDatabaseCaching,
+      overlayModeSetExplicitly,
+    } = overlayDatabaseModeResult.value;
     logger.info(
       `Using overlay database mode: ${overlayDatabaseMode} ` +
         `${useOverlayDatabaseCaching ? "with" : "without"} caching.`,
     );
     config.overlayDatabaseMode = overlayDatabaseMode;
     config.useOverlayDatabaseCaching = useOverlayDatabaseCaching;
+    config.overlayModeSetExplicitly = overlayModeSetExplicitly;
   } else {
     const overlayDisabledReason = overlayDatabaseModeResult.value;
     logger.info(
@@ -1222,18 +1280,18 @@ export async function initConfig(
     );
   }
 
-  if (
-    config.overlayDatabaseMode === OverlayDatabaseMode.Overlay ||
-    (await shouldPerformDiffInformedAnalysis(
-      inputs.codeql,
-      inputs.features,
-      logger,
-    ))
-  ) {
-    config.extraQueryExclusions.push({
-      exclude: { tags: "exclude-from-incremental" },
-    });
-  }
+  const hasDiffRanges = await prepareDiffInformedAnalysis(
+    inputs.codeql,
+    inputs.features,
+    logger,
+  );
+
+  await applyIncrementalAnalysisSettings(
+    config,
+    hasDiffRanges,
+    inputs.codeql,
+    logger,
+  );
 
   if (await isTrapCachingEnabled(features, config.overlayDatabaseMode)) {
     const { trapCaches, trapCacheDownloadTime } = await downloadCacheWithTime(
@@ -1250,39 +1308,61 @@ export async function initConfig(
   return config;
 }
 
-function parseRegistries(
-  registriesInput: string | undefined,
-): RegistryConfigWithCredentials[] | undefined {
-  try {
-    return registriesInput
-      ? (yaml.load(registriesInput) as RegistryConfigWithCredentials[])
-      : undefined;
-  } catch {
-    throw new ConfigurationError(
-      "Invalid registries input. Must be a YAML string.",
-    );
-  }
+/**
+ * Determines if `configPath` is explicitly local. That is, it starts with `LOCAL_PATH_PREFIX`.
+ * A configuration file path that starts with `LOCAL_PATH_PREFIX` is always treated as a local path.
+ *
+ * @param configPath The path to test.
+ */
+function isExplicitLocalPath(configPath: string): boolean {
+  return configPath.startsWith(LOCAL_PATH_PREFIX);
 }
 
-export function parseRegistriesWithoutCredentials(
-  registriesInput?: string,
-): RegistryConfigNoCredentials[] | undefined {
-  return parseRegistries(registriesInput)?.map((r) => {
-    const { url, packages, kind } = r;
-    return { url, packages, kind };
-  });
+/**
+ * Determines if `configPath` starts with the prefix used to explicitly mark a path
+ * as a remote path (`REMOTE_PATH_PREFIX`).
+ *
+ * @param configPath The path to test.
+ */
+function isExplicitRemotePath(configPath: string): boolean {
+  return configPath.startsWith(REMOTE_PATH_PREFIX);
 }
 
+/**
+ * Determines if `configPath` contains a '@' character.
+ *
+ * @param configPath The path to test.
+ */
+function containsAtRef(configPath: string): boolean {
+  return configPath.includes("@");
+}
+
+/**
+ * Determines if `configPath` refers to a local configuration file.
+ *
+ * @param configPath The path to test.
+ * @returns True if it is local, or false otherwise.
+ */
 function isLocal(configPath: string): boolean {
-  // If the path starts with ./, look locally
-  if (configPath.indexOf("./") === 0) {
+  // If the path starts with `LOCAL_PATH_PREFIX`, it is explicitly local.
+  // This allows local paths that would otherwise contain '@'
+  // to be used with a `LOCAL_PATH_PREFIX` prefix.
+  if (isExplicitLocalPath(configPath)) {
     return true;
   }
+  // If the path starts with `REMOTE_PATH_PREFIX`, it is explicitly remote.
+  // This allows users to resolve ambiguity by specifying `REMOTE_PATH_PREFIX`.
+  if (isExplicitRemotePath(configPath)) {
+    return false;
+  }
 
-  return configPath.indexOf("@") === -1;
+  // Otherwise, the path is also local if it does not contain '@'.
+  // This assumes the `OLD_REMOTE_ADDRESS_FORMAT` which must contain a '@'
+  // character for remote addresses.
+  return !containsAtRef(configPath);
 }
 
-function getLocalConfig(
+export function getLocalConfig(
   logger: Logger,
   configFile: string,
   validateConfig: boolean,
@@ -1298,54 +1378,6 @@ function getLocalConfig(
     logger,
     configFile,
     fs.readFileSync(configFile, "utf-8"),
-    validateConfig,
-  );
-}
-
-async function getRemoteConfig(
-  logger: Logger,
-  configFile: string,
-  apiDetails: api.GitHubApiCombinedDetails,
-  validateConfig: boolean,
-): Promise<UserConfig> {
-  // retrieve the various parts of the config location, and ensure they're present
-  const format = new RegExp(
-    "(?<owner>[^/]+)/(?<repo>[^/]+)/(?<path>[^@]+)@(?<ref>.*)",
-  );
-  const pieces = format.exec(configFile);
-  // 5 = 4 groups + the whole expression
-  if (pieces?.groups === undefined || pieces.length < 5) {
-    throw new ConfigurationError(
-      errorMessages.getConfigFileRepoFormatInvalidMessage(configFile),
-    );
-  }
-
-  const response = await api
-    .getApiClientWithExternalAuth(apiDetails)
-    .rest.repos.getContent({
-      owner: pieces.groups.owner,
-      repo: pieces.groups.repo,
-      path: pieces.groups.path,
-      ref: pieces.groups.ref,
-    });
-
-  let fileContents: string;
-  if ("content" in response.data && response.data.content !== undefined) {
-    fileContents = response.data.content;
-  } else if (Array.isArray(response.data)) {
-    throw new ConfigurationError(
-      errorMessages.getConfigFileDirectoryGivenMessage(configFile),
-    );
-  } else {
-    throw new ConfigurationError(
-      errorMessages.getConfigFileFormatInvalidMessage(configFile),
-    );
-  }
-
-  return parseUserConfig(
-    logger,
-    configFile,
-    Buffer.from(fileContents, "base64").toString("binary"),
     validateConfig,
   );
 }
@@ -1531,7 +1563,7 @@ export async function parseBuildModeInput(
   }
 
   if (
-    languages.includes(KnownLanguage.csharp) &&
+    languages.includes(BuiltInLanguage.csharp) &&
     (await features.getValue(Feature.DisableCsharpBuildless))
   ) {
     logger.warning(
@@ -1541,7 +1573,7 @@ export async function parseBuildModeInput(
   }
 
   if (
-    languages.includes(KnownLanguage.java) &&
+    languages.includes(BuiltInLanguage.java) &&
     (await features.getValue(Feature.DisableJavaBuildlessEnabled))
   ) {
     logger.warning(
@@ -1631,26 +1663,6 @@ function getPrimaryAnalysisKind(config: Config): AnalysisKind {
  */
 export function getPrimaryAnalysisConfig(config: Config): AnalysisConfig {
   return getAnalysisConfig(getPrimaryAnalysisKind(config));
-}
-
-/** Logs the Git version as a telemetry diagnostic. */
-async function logGitVersionTelemetry(
-  config: Config,
-  gitVersion: GitVersionInfo,
-): Promise<void> {
-  if (config.languages.length > 0) {
-    addNoLanguageDiagnostic(
-      config,
-      makeTelemetryDiagnostic(
-        "codeql-action/git-version-telemetry",
-        "Git version telemetry",
-        {
-          fullVersion: gitVersion.fullVersion,
-          truncatedVersion: gitVersion.truncatedVersion,
-        },
-      ),
-    );
-  }
 }
 
 /**

@@ -1,12 +1,14 @@
 import test, { ExecutionContext } from "ava";
 
 import { RepositoryProperties } from "../feature-flags/properties";
-import { KnownLanguage, Language } from "../languages";
+import { BuiltInLanguage, Language } from "../languages";
 import { getRunnerLogger } from "../logging";
 import {
   checkExpectedLogMessages,
   getRecordingLogger,
   LoggedMessage,
+  makeMacro,
+  RecordingLogger,
 } from "../testing-utils";
 import { ConfigurationError, prettyPrintPack } from "../util";
 
@@ -15,7 +17,7 @@ import * as dbConfig from "./db-config";
 /**
  * Test macro for ensuring the packs block is valid
  */
-const parsePacksMacro = test.macro({
+const parsePacksMacro = makeMacro({
   exec: (
     t: ExecutionContext<unknown>,
     packsInput: string,
@@ -33,7 +35,7 @@ const parsePacksMacro = test.macro({
 /**
  * Test macro for testing when the packs block is invalid
  */
-const parsePacksErrorMacro = test.macro({
+const parsePacksErrorMacro = makeMacro({
   exec: (
     t: ExecutionContext<unknown>,
     packsInput: string,
@@ -49,45 +51,42 @@ const parsePacksErrorMacro = test.macro({
 /**
  * Test macro for testing when the packs block is invalid
  */
-const invalidPackNameMacro = test.macro({
-  exec: (t: ExecutionContext, name: string) =>
-    parsePacksErrorMacro.exec(
+const invalidPackNameMacro = makeMacro({
+  exec: (t: ExecutionContext, arg: string) =>
+    parsePacksErrorMacro.fn(
       t,
-      name,
-      [KnownLanguage.cpp],
-      new RegExp(`^"${name}" is not a valid pack$`),
+      arg,
+      [BuiltInLanguage.cpp],
+      new RegExp(`^"${arg}" is not a valid pack$`),
     ),
   title: (_providedTitle: string | undefined, arg: string | undefined) =>
     `Invalid pack string: ${arg}`,
 });
 
-test("no packs", parsePacksMacro, "", [], undefined);
-test("two packs", parsePacksMacro, "a/b,c/d@1.2.3", [KnownLanguage.cpp], {
-  [KnownLanguage.cpp]: ["a/b", "c/d@1.2.3"],
+parsePacksMacro("no packs", "", [], undefined);
+parsePacksMacro("two packs", "a/b,c/d@1.2.3", [BuiltInLanguage.cpp], {
+  [BuiltInLanguage.cpp]: ["a/b", "c/d@1.2.3"],
 });
-test(
+parsePacksMacro(
   "two packs with spaces",
-  parsePacksMacro,
   " a/b , c/d@1.2.3 ",
-  [KnownLanguage.cpp],
+  [BuiltInLanguage.cpp],
   {
-    [KnownLanguage.cpp]: ["a/b", "c/d@1.2.3"],
+    [BuiltInLanguage.cpp]: ["a/b", "c/d@1.2.3"],
   },
 );
-test(
+parsePacksErrorMacro(
   "two packs with language",
-  parsePacksErrorMacro,
   "a/b,c/d@1.2.3",
-  [KnownLanguage.cpp, KnownLanguage.java],
+  [BuiltInLanguage.cpp, BuiltInLanguage.java],
   new RegExp(
     "Cannot specify a 'packs' input in a multi-language analysis. " +
       "Use a codeql-config.yml file instead and specify packs by language.",
   ),
 );
 
-test(
+parsePacksMacro(
   "packs with other valid names",
-  parsePacksMacro,
   [
     // ranges are ok
     "c/d@1.0",
@@ -106,9 +105,9 @@ test(
     // (globbing is not done)
     "c/d@1.2.3:+*)_(",
   ].join(","),
-  [KnownLanguage.cpp],
+  [BuiltInLanguage.cpp],
   {
-    [KnownLanguage.cpp]: [
+    [BuiltInLanguage.cpp]: [
       "c/d@1.0",
       "c/d@~1.0.0",
       "c/d@~1.0.0:a/b",
@@ -123,23 +122,23 @@ test(
   },
 );
 
-test(invalidPackNameMacro, "c"); // all packs require at least a scope and a name
-test(invalidPackNameMacro, "c-/d");
-test(invalidPackNameMacro, "-c/d");
-test(invalidPackNameMacro, "c/d_d");
-test(invalidPackNameMacro, "c/d@@");
-test(invalidPackNameMacro, "c/d@1.0.0:");
-test(invalidPackNameMacro, "c/d:");
-test(invalidPackNameMacro, "c/d:/a");
-test(invalidPackNameMacro, "@1.0.0:a");
-test(invalidPackNameMacro, "c/d@../a");
-test(invalidPackNameMacro, "c/d@b/../a");
-test(invalidPackNameMacro, "c/d:z@1");
+invalidPackNameMacro.test("c"); // all packs require at least a scope and a name
+invalidPackNameMacro.test("c-/d");
+invalidPackNameMacro.test("-c/d");
+invalidPackNameMacro.test("c/d_d");
+invalidPackNameMacro.test("c/d@@");
+invalidPackNameMacro.test("c/d@1.0.0:");
+invalidPackNameMacro.test("c/d:");
+invalidPackNameMacro.test("c/d:/a");
+invalidPackNameMacro.test("@1.0.0:a");
+invalidPackNameMacro.test("c/d@../a");
+invalidPackNameMacro.test("c/d@b/../a");
+invalidPackNameMacro.test("c/d:z@1");
 
 /**
  * Test macro for pretty printing pack specs
  */
-const packSpecPrettyPrintingMacro = test.macro({
+const packSpecPrettyPrintingMacro = makeMacro({
   exec: (t: ExecutionContext, packStr: string, packObj: dbConfig.Pack) => {
     const parsed = dbConfig.parsePacksSpecification(packStr);
     t.deepEqual(parsed, packObj, "parsed pack spec is correct");
@@ -163,36 +162,35 @@ const packSpecPrettyPrintingMacro = test.macro({
   ) => `Prettyprint pack spec: '${packStr}'`,
 });
 
-test(packSpecPrettyPrintingMacro, "a/b", {
+packSpecPrettyPrintingMacro.test("a/b", {
   name: "a/b",
   version: undefined,
   path: undefined,
 });
-test(packSpecPrettyPrintingMacro, "a/b@~1.2.3", {
+packSpecPrettyPrintingMacro.test("a/b@~1.2.3", {
   name: "a/b",
   version: "~1.2.3",
   path: undefined,
 });
-test(packSpecPrettyPrintingMacro, "a/b@~1.2.3:abc/def", {
+packSpecPrettyPrintingMacro.test("a/b@~1.2.3:abc/def", {
   name: "a/b",
   version: "~1.2.3",
   path: "abc/def",
 });
-test(packSpecPrettyPrintingMacro, "a/b:abc/def", {
+packSpecPrettyPrintingMacro.test("a/b:abc/def", {
   name: "a/b",
   version: undefined,
   path: "abc/def",
 });
-test(packSpecPrettyPrintingMacro, "    a/b:abc/def    ", {
+packSpecPrettyPrintingMacro.test("    a/b:abc/def    ", {
   name: "a/b",
   version: undefined,
   path: "abc/def",
 });
 
-const calculateAugmentationMacro = test.macro({
+const calculateAugmentationMacro = makeMacro({
   exec: async (
     t: ExecutionContext,
-    _title: string,
     rawPacksInput: string | undefined,
     rawQueriesInput: string | undefined,
     languages: Language[],
@@ -207,27 +205,25 @@ const calculateAugmentationMacro = test.macro({
     );
     t.deepEqual(actualAugmentationProperties, expectedAugmentationProperties);
   },
-  title: (_, title) => `Calculate Augmentation: ${title}`,
+  title: (title) => `Calculate Augmentation: ${title}`,
 });
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "All empty",
   undefined,
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   {
     ...dbConfig.defaultAugmentationProperties,
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With queries",
   undefined,
   " a, b , c, d",
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   {
     ...dbConfig.defaultAugmentationProperties,
@@ -235,12 +231,11 @@ test(
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With queries combining",
   undefined,
   "   +   a, b , c, d ",
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   {
     ...dbConfig.defaultAugmentationProperties,
@@ -249,12 +244,11 @@ test(
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With packs",
   "   codeql/a , codeql/b   , codeql/c  , codeql/d  ",
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   {
     ...dbConfig.defaultAugmentationProperties,
@@ -262,12 +256,11 @@ test(
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With packs combining",
   "   +   codeql/a, codeql/b, codeql/c, codeql/d",
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   {
     ...dbConfig.defaultAugmentationProperties,
@@ -276,12 +269,11 @@ test(
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With repo property queries",
   undefined,
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {
     "github-codeql-extra-queries": "a, b, c, d",
   },
@@ -294,12 +286,11 @@ test(
   },
 );
 
-test(
-  calculateAugmentationMacro,
+calculateAugmentationMacro(
   "With repo property queries combining",
   undefined,
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {
     "github-codeql-extra-queries": "+ a, b, c, d",
   },
@@ -312,10 +303,9 @@ test(
   },
 );
 
-const calculateAugmentationErrorMacro = test.macro({
+const calculateAugmentationErrorMacro = makeMacro({
   exec: async (
     t: ExecutionContext,
-    _title: string,
     rawPacksInput: string | undefined,
     rawQueriesInput: string | undefined,
     languages: Language[],
@@ -333,53 +323,48 @@ const calculateAugmentationErrorMacro = test.macro({
       { message: expectedError },
     );
   },
-  title: (_, title) => `Calculate Augmentation Error: ${title}`,
+  title: (title) => `Calculate Augmentation Error: ${title}`,
 });
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Plus (+) with nothing else (queries)",
   undefined,
   "   +   ",
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   /The workflow property "queries" is invalid/,
 );
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Plus (+) with nothing else (packs)",
   "   +   ",
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   /The workflow property "packs" is invalid/,
 );
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Plus (+) with nothing else (repo property queries)",
   undefined,
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {
     "github-codeql-extra-queries": "    + ",
   },
   /The repository property "github-codeql-extra-queries" is invalid/,
 );
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Packs input with multiple languages",
   "   +  a/b, c/d ",
   undefined,
-  [KnownLanguage.javascript, KnownLanguage.java],
+  [BuiltInLanguage.javascript, BuiltInLanguage.java],
   {},
   /Cannot specify a 'packs' input in a multi-language analysis/,
 );
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Packs input with no languages",
   "   +  a/b, c/d ",
   undefined,
@@ -388,12 +373,11 @@ test(
   /No languages specified/,
 );
 
-test(
-  calculateAugmentationErrorMacro,
+calculateAugmentationErrorMacro(
   "Invalid packs",
   " a-pack-without-a-scope ",
   undefined,
-  [KnownLanguage.javascript],
+  [BuiltInLanguage.javascript],
   {},
   /"a-pack-without-a-scope" is not a valid pack/,
 );
@@ -504,4 +488,140 @@ test("parseUserConfig - throws no ConfigurationError if validation should fail, 
       false,
     ),
   );
+});
+
+test("mergeDefaultSetupAndUserConfigs - combines threat models", async (t) => {
+  const logger = new RecordingLogger();
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    { "threat-models": ["a", "b"] },
+    { "threat-models": ["local", "remote"] },
+  );
+
+  const threatModels = result["threat-models"];
+
+  if (t.truthy(threatModels)) {
+    t.deepEqual(threatModels, ["a", "b", "local", "remote"]);
+  }
+});
+
+test("mergeDefaultSetupAndUserConfigs - warns if user-supplied config contains default setup key", async (t) => {
+  const logger = new RecordingLogger();
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    {},
+    { "default-setup": {} },
+  );
+
+  // User-supplied value is ignored.
+  t.deepEqual(result, {});
+
+  // Warning is logged.
+  t.true(
+    logger.hasMessage(
+      "The 'default-setup' configuration key is not supported in user-supplied configuration files",
+    ),
+  );
+});
+
+test("mergeDefaultSetupAndUserConfigs - keeps default setup key from 'config' input", async (t) => {
+  const logger = new RecordingLogger();
+  const expected: dbConfig.DefaultSetupConfig = {
+    org: { "model-packs": ["some-pack"] },
+  };
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    { "default-setup": expected },
+    {},
+  );
+
+  // Result matches the input.
+  t.deepEqual(result["default-setup"], expected);
+
+  // No warning is logged.
+  t.false(
+    logger.hasMessage(
+      "The 'default-setup' configuration key is not supported in user-supplied configuration files",
+    ),
+  );
+});
+
+test("mergeDefaultSetupAndUserConfigs - keeps other properties from user-supplied configuration", async (t) => {
+  const logger = new RecordingLogger();
+  const configFile: dbConfig.UserConfig = {
+    "query-filters": [{ exclude: { a: "b" } }],
+    "paths-ignore": ["path"],
+  };
+
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    {},
+    configFile,
+  );
+
+  t.deepEqual(result, configFile);
+});
+
+test("mergeDefaultSetupAndUserConfigs - ignores, but warns about, unknown keys from Default Setup", async (t) => {
+  const logger = new RecordingLogger();
+  const configFile: dbConfig.UserConfig = {
+    "query-filters": [{ exclude: { a: "b" } }],
+    "paths-ignore": ["path"],
+  };
+
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    {
+      "default-setup": {
+        borg: [],
+        org: {
+          unknown: "foo",
+          "model-packs": [],
+        },
+      } as unknown as dbConfig.DefaultSetupConfig,
+      "paths-ignore": ["other-path"],
+    },
+    configFile,
+  );
+
+  t.deepEqual(result, {
+    ...configFile,
+    "default-setup": { org: { "model-packs": [] } },
+  });
+
+  const expectedUnrecognisedKeys = [
+    ".default-setup.org.unknown",
+    ".default-setup.borg",
+    ".paths-ignore",
+  ].join(", ");
+  checkExpectedLogMessages(t, logger.messages, [
+    `Unrecognised keys in Default Setup configuration: ${expectedUnrecognisedKeys}`,
+  ]);
+});
+
+test("mergeDefaultSetupAndUserConfigs - warns about invalid keys from Default Setup", async (t) => {
+  const logger = new RecordingLogger();
+  const configFile: dbConfig.UserConfig = {};
+
+  const result = dbConfig.mergeDefaultSetupAndUserConfigs(
+    logger,
+    {
+      "default-setup": {
+        org: {
+          "model-packs": [123],
+        },
+      } as unknown as dbConfig.DefaultSetupConfig,
+    },
+    configFile,
+  );
+
+  t.deepEqual(result, {
+    ...configFile,
+    "default-setup": { org: { "model-packs": [123] } },
+  });
+
+  const expectedInvalidKeys = [".default-setup.org.model-packs[0]"].join(", ");
+  checkExpectedLogMessages(t, logger.messages, [
+    `Invalid keys in Default Setup configuration: ${expectedInvalidKeys}`,
+  ]);
 });

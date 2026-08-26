@@ -2,11 +2,13 @@ import * as github from "@actions/github";
 import * as githubUtils from "@actions/github/lib/utils";
 import test from "ava";
 import * as sinon from "sinon";
+import { ProxyAgent } from "undici";
 
 import * as actionsUtil from "./actions-util";
 import * as api from "./api-client";
 import { DO_NOT_RETRY_STATUSES } from "./api-client";
-import { setupTests } from "./testing-utils";
+import { ActionsEnvVars, RegistryProxyVars } from "./environment";
+import { callee, getTestEnv, setupTests } from "./testing-utils";
 import * as util from "./util";
 
 setupTests(test);
@@ -20,23 +22,23 @@ test.serial("getApiClient", async (t) => {
   const githubStub: sinon.SinonStub = sinon.stub();
   pluginStub.returns(githubStub);
 
+  const env = getTestEnv();
+  env.set(ActionsEnvVars.GITHUB_SERVER_URL, "http://github.localhost");
+  env.set(ActionsEnvVars.GITHUB_API_URL, "http://api.github.localhost");
+
   sinon.stub(actionsUtil, "getRequiredInput").withArgs("token").returns("xyz");
-  const requiredEnvParamStub = sinon.stub(util, "getRequiredEnvParam");
-  requiredEnvParamStub
-    .withArgs("GITHUB_SERVER_URL")
-    .returns("http://github.localhost");
-  requiredEnvParamStub
-    .withArgs("GITHUB_API_URL")
-    .returns("http://api.github.localhost");
 
-  api.getApiClient();
+  const apiClient = api.getApiClient(env);
+  t.truthy(apiClient);
 
+  t.true(githubStub.calledOnce);
   t.assert(
     githubStub.calledOnceWithExactly({
       auth: "token xyz",
       baseUrl: "http://api.github.localhost",
       log: sinon.match.any,
       userAgent: `CodeQL-Action/${actionsUtil.getActionVersion()}`,
+      request: sinon.match.any,
       retry: {
         doNotRetry: DO_NOT_RETRY_STATUSES,
       },
@@ -181,6 +183,7 @@ test.serial(
       "Code Security must be enabled for this repository to use code scanning",
       "Advanced Security must be enabled for this repository to use code scanning",
       "Code Scanning is not enabled for this repository. Please enable code scanning in the repository settings.",
+      "Code quality is not enabled for this repository. Please enable code quality in the repository settings.",
     ];
     const transforms = [
       (msg: string) => msg,
@@ -205,3 +208,67 @@ test.serial(
     }
   },
 );
+
+test("getRegistryProxy - returns undefined if the proxy is not configured", async (t) => {
+  const target = callee(api.getRegistryProxy).withArgs();
+
+  // Empty environment.
+  await target.passes(t.is, undefined);
+  // Only the host.
+  await target
+    .withEnv(getTestEnv({ [RegistryProxyVars.PROXY_HOST]: "localhost" }))
+    .passes(t.is, undefined);
+  // Only the port.
+  await target
+    .withEnv(getTestEnv({ [RegistryProxyVars.PROXY_PORT]: "1234" }))
+    .passes(t.is, undefined);
+});
+
+test("getRegistryProxy - returns value when both vars are set", async (t) => {
+  await callee(api.getRegistryProxy)
+    .withArgs()
+    .withEnv(
+      getTestEnv({
+        [RegistryProxyVars.PROXY_HOST]: "localhost",
+        [RegistryProxyVars.PROXY_PORT]: "1234",
+      }),
+    )
+    .passes(t.truthy);
+});
+
+test("getRegistryProxyConfig - gets the configuration from the env vars", async (t) => {
+  const host = "localhost";
+  const port = "1234";
+  const ca = "cert";
+
+  await callee(api.getRegistryProxyConfig)
+    .withArgs()
+    .withEnv(
+      getTestEnv({
+        [RegistryProxyVars.PROXY_HOST]: host,
+        [RegistryProxyVars.PROXY_PORT]: port,
+        [RegistryProxyVars.PROXY_CA_CERTIFICATE]: ca,
+      }),
+    )
+    .passes(t.like, { host, port, ca });
+});
+
+test("makeProxyRequestOptions - returns defaults without custom proxy", async (t) => {
+  t.deepEqual(
+    api.makeProxyRequestOptions(undefined),
+    githubUtils.defaults.request,
+  );
+});
+
+test("makeProxyRequestOptions - returns fetch with custom proxy", async (t) => {
+  const opts = api.makeProxyRequestOptions(
+    new ProxyAgent("http://localhost:1080"),
+  );
+  // Fetch should be different from the defaults.
+  t.notDeepEqual(opts?.fetch, githubUtils.defaults.request?.fetch);
+  // The options should be the same aside from that.
+  t.deepEqual(
+    { ...opts, fetch: githubUtils.defaults.request?.fetch },
+    githubUtils.defaults.request,
+  );
+});

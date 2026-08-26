@@ -8,15 +8,17 @@ import sinon from "sinon";
 import * as apiClient from "./api-client";
 import * as defaults from "./defaults.json";
 import { setUpFeatureFlagTests } from "./feature-flags/testing-util";
-import { KnownLanguage } from "./languages";
+import { UnvalidatedObject, validateSchema } from "./json";
+import { makeFromSchema } from "./json/testing-util";
+import { BuiltInLanguage } from "./languages";
 import { getRunnerLogger, Logger } from "./logging";
 import * as startProxyExports from "./start-proxy";
-import { parseLanguage } from "./start-proxy";
 import * as statusReport from "./status-report";
 import {
+  assertNotLogged,
   checkExpectedLogMessages,
   createFeatures,
-  getRecordingLogger,
+  makeMacro,
   makeTestToken,
   RecordingLogger,
   setupTests,
@@ -31,7 +33,7 @@ import {
 
 setupTests(test);
 
-const sendFailedStatusReportTest = test.macro({
+const sendFailedStatusReportTest = makeMacro({
   exec: async (
     t: ExecutionContext<unknown>,
     err: Error,
@@ -87,16 +89,14 @@ const sendFailedStatusReportTest = test.macro({
   title: (providedTitle = "") => `sendFailedStatusReport - ${providedTitle}`,
 });
 
-test.serial(
+sendFailedStatusReportTest.serial(
   "reports generic error message for non-StartProxyError error",
-  sendFailedStatusReportTest,
   new Error("Something went wrong today"),
   "Error from start-proxy Action omitted (Error).",
 );
 
-test.serial(
+sendFailedStatusReportTest.serial(
   "reports generic error message for non-StartProxyError error with safe error message",
-  sendFailedStatusReportTest,
   new Error(
     startProxyExports.getStartProxyErrorMessage(
       startProxyExports.StartProxyErrorType.DownloadFailed,
@@ -105,9 +105,8 @@ test.serial(
   "Error from start-proxy Action omitted (Error).",
 );
 
-test.serial(
+sendFailedStatusReportTest.serial(
   "reports generic error message for ConfigurationError error",
-  sendFailedStatusReportTest,
   new ConfigurationError("Something went wrong today"),
   "Error from start-proxy Action omitted (ConfigurationError).",
   "user-error",
@@ -121,8 +120,19 @@ const mixedCredentials = [
   { type: "maven_repository", host: "maven.pkg.github.com", token: "def" },
   { type: "nuget_feed", host: "nuget.pkg.github.com", token: "ghi" },
   { type: "goproxy_server", host: "goproxy.example.com", token: "jkl" },
-  { type: "git_source", host: "github.com/github", token: "mno" },
 ];
+
+const gitSourceCredential = {
+  type: "git_source",
+  host: "github.com/github",
+  token: "mno",
+};
+
+const dockerRegistryCredential = {
+  type: "docker_registry",
+  host: "https://registry.example.com",
+  token: "pqr",
+};
 
 test("getCredentials prefers registriesCredentials over registrySecrets", async (t) => {
   const registryCredentials = Buffer.from(
@@ -232,7 +242,7 @@ test("getCredentials filters by language when specified", async (t) => {
     getRunnerLogger(true),
     undefined,
     toEncodedJSON(mixedCredentials),
-    KnownLanguage.java,
+    BuiltInLanguage.java,
   );
   t.is(credentials.length, 1);
   t.is(credentials[0].type, "maven_repository");
@@ -242,14 +252,65 @@ test("getCredentials returns all for a language when specified", async (t) => {
   const credentials = startProxyExports.getCredentials(
     getRunnerLogger(true),
     undefined,
-    toEncodedJSON(mixedCredentials),
-    KnownLanguage.go,
+    toEncodedJSON([...mixedCredentials, gitSourceCredential]),
+    BuiltInLanguage.go,
   );
   t.is(credentials.length, 2);
 
   const credentialsTypes = credentials.map((c) => c.type);
   t.assert(credentialsTypes.includes("goproxy_server"));
   t.assert(credentialsTypes.includes("git_source"));
+});
+
+test("getCredentials returns all goproxy_servers for Go when specified", async (t) => {
+  const multipleGoproxyServers = [
+    { type: "goproxy_server", host: "goproxy1.example.com", token: "token1" },
+    { type: "goproxy_server", host: "goproxy2.example.com", token: "token2" },
+    { type: "git_source", host: "github.com/github", token: "mno" },
+  ];
+
+  const credentials = startProxyExports.getCredentials(
+    getRunnerLogger(true),
+    undefined,
+    toEncodedJSON(multipleGoproxyServers),
+    BuiltInLanguage.go,
+  );
+  t.is(credentials.length, 3);
+
+  const goproxyServers = credentials.filter((c) => c.type === "goproxy_server");
+  t.is(goproxyServers.length, 2);
+  t.assert(goproxyServers.some((c) => c.host === "goproxy1.example.com"));
+  t.assert(goproxyServers.some((c) => c.host === "goproxy2.example.com"));
+});
+
+test("getCredentials returns all maven_repositories for Java when specified", async (t) => {
+  const multipleMavenRepositories = [
+    {
+      type: "maven_repository",
+      host: "maven1.pkg.github.com",
+      token: "token1",
+    },
+    {
+      type: "maven_repository",
+      host: "maven2.pkg.github.com",
+      token: "token2",
+    },
+    { type: "goproxy_server", host: "github.com/github", token: "mno" },
+  ];
+
+  const credentials = startProxyExports.getCredentials(
+    getRunnerLogger(true),
+    undefined,
+    toEncodedJSON(multipleMavenRepositories),
+    BuiltInLanguage.java,
+  );
+  t.is(credentials.length, 2);
+
+  const mavenRepositories = credentials.filter(
+    (c) => c.type === "maven_repository",
+  );
+  t.assert(mavenRepositories.some((c) => c.host === "maven1.pkg.github.com"));
+  t.assert(mavenRepositories.some((c) => c.host === "maven2.pkg.github.com"));
 });
 
 test("getCredentials returns all credentials when no language specified", async (t) => {
@@ -299,233 +360,329 @@ test("getCredentials throws an error when non-printable characters are used", as
   }
 });
 
-const validAzureCredential: startProxyExports.AzureConfig = {
-  tenant_id: "12345678-1234-1234-1234-123456789012",
-  client_id: "abcdef01-2345-6789-abcd-ef0123456789",
-};
+for (const oidcSchemaInfo of startProxyExports.oidcSchemas) {
+  test(`getCredentials throws when non-printable characters are used (${oidcSchemaInfo.name} OIDC)`, (t) => {
+    const validCredential = makeFromSchema(true, oidcSchemaInfo.schema);
+    for (const key of Object.keys(validCredential)) {
+      const invalidAuthConfig = {
+        ...validCredential,
+        [key]: "123\x00",
+      };
+      const invalidCredential: startProxyExports.RawCredential = {
+        type: "nuget_feed",
+        host: `${key}.nuget.pkg.github.com`,
+        ...invalidAuthConfig,
+      };
+      const credentialsInput = toEncodedJSON([invalidCredential]);
 
-const validAwsCredential: startProxyExports.AWSConfig = {
-  aws_region: "us-east-1",
-  account_id: "123456789012",
-  role_name: "MY_ROLE",
-  domain: "MY_DOMAIN",
-  domain_owner: "987654321098",
-  audience: "custom-audience",
-};
-
-const validJFrogCredential: startProxyExports.JFrogConfig = {
-  jfrog_oidc_provider_name: "MY_PROVIDER",
-  audience: "jfrog-audience",
-  identity_mapping_name: "my-mapping",
-};
-
-test("getCredentials throws an error when non-printable characters are used for Azure OIDC", (t) => {
-  for (const key of Object.keys(validAzureCredential)) {
-    const invalidAzureCredential = {
-      ...validAzureCredential,
-      [key]: "123\x00",
-    };
-    const invalidCredential: startProxyExports.RawCredential = {
-      type: "nuget_feed",
-      host: `${key}.nuget.pkg.github.com`,
-      ...invalidAzureCredential,
-    };
-    const credentialsInput = toEncodedJSON([invalidCredential]);
-
-    t.throws(
-      () =>
-        startProxyExports.getCredentials(
-          getRunnerLogger(true),
-          undefined,
-          credentialsInput,
-          undefined,
-        ),
-      {
-        message:
-          "Invalid credentials - fields must contain only printable characters",
-      },
-    );
-  }
-});
-
-test("getCredentials throws an error when non-printable characters are used for AWS OIDC", (t) => {
-  for (const key of Object.keys(validAwsCredential)) {
-    const invalidAwsCredential = {
-      ...validAwsCredential,
-      [key]: "123\x00",
-    };
-    const invalidCredential: startProxyExports.RawCredential = {
-      type: "nuget_feed",
-      host: `${key}.nuget.pkg.github.com`,
-      ...invalidAwsCredential,
-    };
-    const credentialsInput = toEncodedJSON([invalidCredential]);
-
-    t.throws(
-      () =>
-        startProxyExports.getCredentials(
-          getRunnerLogger(true),
-          undefined,
-          credentialsInput,
-          undefined,
-        ),
-      {
-        message:
-          "Invalid credentials - fields must contain only printable characters",
-      },
-    );
-  }
-});
-
-test("getCredentials throws an error when non-printable characters are used for JFrog OIDC", (t) => {
-  for (const key of Object.keys(validJFrogCredential)) {
-    const invalidJFrogCredential = {
-      ...validJFrogCredential,
-      [key]: "123\x00",
-    };
-    const invalidCredential: startProxyExports.RawCredential = {
-      type: "nuget_feed",
-      host: `${key}.nuget.pkg.github.com`,
-      ...invalidJFrogCredential,
-    };
-    const credentialsInput = toEncodedJSON([invalidCredential]);
-
-    t.throws(
-      () =>
-        startProxyExports.getCredentials(
-          getRunnerLogger(true),
-          undefined,
-          credentialsInput,
-          undefined,
-        ),
-      {
-        message:
-          "Invalid credentials - fields must contain only printable characters",
-      },
-    );
-  }
-});
+      t.throws(
+        () =>
+          startProxyExports.getCredentials(
+            getRunnerLogger(true),
+            undefined,
+            credentialsInput,
+            undefined,
+          ),
+        {
+          message:
+            "Invalid credentials - fields must contain only printable characters",
+        },
+      );
+    }
+  });
+}
 
 test("getCredentials accepts OIDC configurations", (t) => {
-  const oidcConfigurations = [
-    {
+  const oidcConfigurations = startProxyExports.oidcSchemas.map(
+    (schemaInfo) => ({
       type: "nuget_feed",
-      host: "azure.pkg.github.com",
-      ...validAzureCredential,
-    },
-    {
-      type: "nuget_feed",
-      host: "aws.pkg.github.com",
-      ...validAwsCredential,
-    },
-    {
-      type: "nuget_feed",
-      host: "jfrog.pkg.github.com",
-      ...validJFrogCredential,
-    },
-  ];
+      host: `${schemaInfo.name.toLowerCase()}.pkg.github.com`,
+      ...makeFromSchema(true, schemaInfo.schema),
+    }),
+  );
 
   const credentials = startProxyExports.getCredentials(
     getRunnerLogger(true),
     undefined,
     toEncodedJSON(oidcConfigurations),
-    KnownLanguage.csharp,
+    BuiltInLanguage.csharp,
   );
-  t.is(credentials.length, 3);
+  t.is(credentials.length, startProxyExports.oidcSchemas.length);
 
   t.assert(credentials.every((c) => c.type === "nuget_feed"));
-  t.assert(credentials.some((c) => startProxyExports.isAzureConfig(c)));
-  t.assert(credentials.some((c) => startProxyExports.isAWSConfig(c)));
-  t.assert(credentials.some((c) => startProxyExports.isJFrogConfig(c)));
+
+  for (const oidcSchemaInfo of startProxyExports.oidcSchemas) {
+    t.assert(
+      credentials.some((c) =>
+        validateSchema(
+          oidcSchemaInfo.schema,
+          c as unknown as UnvalidatedObject<any>,
+        ),
+      ),
+    );
+  }
 });
 
-test("getCredentials logs a warning when a PAT is used without a username", async (t) => {
-  const loggedMessages = [];
-  const logger = getRecordingLogger(loggedMessages);
-  const likelyWrongCredentials = toEncodedJSON([
+const getCredentialsMacro = makeMacro({
+  exec: async (
+    t: ExecutionContext<unknown>,
+    credentials: startProxyExports.RawCredential[],
+    checkAccepted: (
+      t: ExecutionContext<unknown>,
+      logger: RecordingLogger,
+      results: startProxyExports.Credential[],
+    ) => void,
+  ) => {
+    const logger = new RecordingLogger();
+    const credentialsString = toEncodedJSON(credentials);
+
+    const results = startProxyExports.getCredentials(
+      logger,
+      undefined,
+      credentialsString,
+      undefined,
+    );
+
+    checkAccepted(t, logger, results);
+  },
+
+  title: (providedTitle = "") => `getCredentials - ${providedTitle}`,
+});
+
+getCredentialsMacro(
+  "warns for PAT-like password without a username",
+  [
     {
       type: "git_server",
       host: "https://github.com/",
       password: `ghp_${makeTestToken()}`,
     },
+  ],
+  (t, logger, results) => {
+    // The configurations should be accepted, despite the likely problem.
+    t.assert(results);
+    t.is(results.length, 1);
+    t.is(results[0].type, "git_server");
+    t.is(results[0].host, "https://github.com/");
+
+    if (startProxyExports.hasUsernameAndPassword(results[0])) {
+      t.assert(results[0].password?.startsWith("ghp_"));
+    } else {
+      t.fail("Expected a `UsernamePassword`-based credential.");
+    }
+
+    // A warning should have been logged.
+    checkExpectedLogMessages(t, logger.messages, [
+      "using a GitHub Personal Access Token (PAT), but no username was provided",
+    ]);
+  },
+);
+
+getCredentialsMacro(
+  "no warning for PAT-like password with a username",
+  [
+    {
+      type: "git_server",
+      host: "https://github.com/",
+      username: "someone",
+      password: `ghp_${makeTestToken()}`,
+    },
+  ],
+  (t, logger, results) => {
+    // The configurations should be accepted, despite the likely problem.
+    t.assert(results);
+    t.is(results.length, 1);
+    t.is(results[0].type, "git_server");
+    t.is(results[0].host, "https://github.com/");
+
+    if (startProxyExports.hasUsernameAndPassword(results[0])) {
+      t.assert(results[0].password?.startsWith("ghp_"));
+    } else {
+      t.fail("Expected a `UsernamePassword`-based credential.");
+    }
+
+    assertNotLogged(
+      t,
+      logger,
+      "using a GitHub Personal Access Token (PAT), but no username was provided",
+    );
+  },
+);
+
+getCredentialsMacro(
+  "warns for PAT-like token without a username",
+  [
+    {
+      type: "git_server",
+      host: "https://github.com/",
+      token: `ghp_${makeTestToken()}`,
+    },
+  ],
+  (t, logger, results) => {
+    // The configurations should be accepted, despite the likely problem.
+    t.assert(results);
+    t.is(results.length, 1);
+    t.is(results[0].type, "git_server");
+    t.is(results[0].host, "https://github.com/");
+
+    if (startProxyExports.isToken(results[0])) {
+      t.assert(results[0].token?.startsWith("ghp_"));
+    } else {
+      t.fail("Expected a `Token`-based credential.");
+    }
+
+    // A warning should have been logged.
+    checkExpectedLogMessages(t, logger.messages, [
+      "using a GitHub Personal Access Token (PAT), but no username was provided",
+    ]);
+  },
+);
+
+getCredentialsMacro(
+  "no warning for PAT-like token with a username",
+  [
+    {
+      type: "git_server",
+      host: "https://github.com/",
+      username: "someone",
+      token: `ghp_${makeTestToken()}`,
+    },
+  ],
+  (t, logger, results) => {
+    // The configurations should be accepted, despite the likely problem.
+    t.assert(results);
+    t.is(results.length, 1);
+    t.is(results[0].type, "git_server");
+    t.is(results[0].host, "https://github.com/");
+
+    if (startProxyExports.isToken(results[0])) {
+      t.assert(results[0].token?.startsWith("ghp_"));
+    } else {
+      t.fail("Expected a `Token`-based credential.");
+    }
+
+    assertNotLogged(
+      t,
+      logger,
+      "using a GitHub Personal Access Token (PAT), but no username was provided",
+    );
+  },
+);
+
+test("getCredentials validates 'replaces-base' correctly", async (t) => {
+  // Valid cases.
+  const credentialsInput = toEncodedJSON([
+    {
+      type: "maven_repository",
+      host: "maven1.pkg.github.com",
+      token: "abc",
+      "replaces-base": false,
+    },
+    {
+      type: "maven_repository",
+      host: "maven2.pkg.github.com",
+      token: "def",
+      "replaces-base": true,
+    },
+    {
+      type: "maven_repository",
+      host: "maven3.pkg.github.com",
+      token: "ghi",
+    },
   ]);
 
-  const results = startProxyExports.getCredentials(
-    logger,
+  const credentials = startProxyExports.getCredentials(
+    getRunnerLogger(true),
     undefined,
-    likelyWrongCredentials,
-    undefined,
+    credentialsInput,
+    BuiltInLanguage.java,
   );
 
-  // The configuration should be accepted, despite the likely problem.
-  t.assert(results);
-  t.is(results.length, 1);
-  t.is(results[0].type, "git_server");
-  t.is(results[0].host, "https://github.com/");
+  t.is(credentials.length, 3);
+  t.true(credentials.some((c) => c["replaces-base"] === true));
+  t.true(credentials.some((c) => c["replaces-base"] === false));
+  t.true(credentials.some((c) => c["replaces-base"] === undefined));
 
-  if (startProxyExports.isUsernamePassword(results[0])) {
-    t.assert(results[0].password?.startsWith("ghp_"));
-  } else {
-    t.fail("Expected a `UsernamePassword`-based credential.");
+  // Invalid cases.
+  const baseInvalid = {
+    type: "maven_repository",
+    host: "maven4.pkg.github.com",
+    token: "jkl",
+  };
+  t.throws(() =>
+    startProxyExports.getCredentials(
+      getRunnerLogger(true),
+      undefined,
+      toEncodedJSON([{ ...baseInvalid, "replaces-base": null }]),
+      BuiltInLanguage.java,
+    ),
+  );
+  t.throws(() =>
+    startProxyExports.getCredentials(
+      getRunnerLogger(true),
+      undefined,
+      toEncodedJSON([{ ...baseInvalid, "replaces-base": 123 }]),
+      BuiltInLanguage.java,
+    ),
+  );
+  t.throws(() =>
+    startProxyExports.getCredentials(
+      getRunnerLogger(true),
+      undefined,
+      toEncodedJSON([{ ...baseInvalid, "replaces-base": "true" }]),
+      BuiltInLanguage.java,
+    ),
+  );
+});
+
+test("getCredentials returns only ALWAYS_ENABLED_REGISTRY_TYPE credentials for Actions", async (t) => {
+  const credentialsInput = toEncodedJSON([
+    ...mixedCredentials,
+    gitSourceCredential,
+    dockerRegistryCredential,
+  ]);
+
+  const credentials = startProxyExports.getCredentials(
+    getRunnerLogger(true),
+    undefined,
+    credentialsInput,
+    BuiltInLanguage.actions,
+  );
+
+  for (const credential of credentials) {
+    t.true(
+      startProxyExports.ALWAYS_ENABLED_REGISTRY_TYPE.some(
+        (ty) => ty === credential.type,
+      ),
+    );
+  }
+});
+
+test("getCredentials always returns ALWAYS_ENABLED_REGISTRY_TYPE credentials for all languages", async (t) => {
+  const alwaysEnabledCredentials: startProxyExports.Credential[] = [];
+
+  for (const alwaysEnabled of startProxyExports.ALWAYS_ENABLED_REGISTRY_TYPE) {
+    alwaysEnabledCredentials.push({
+      type: alwaysEnabled,
+      host: `host-${alwaysEnabled}`,
+      token: `bar-${alwaysEnabled}`,
+      url: `url-${alwaysEnabled}`,
+    });
   }
 
-  // A warning should have been logged.
-  checkExpectedLogMessages(t, loggedMessages, [
-    "using a GitHub Personal Access Token (PAT), but no username was provided",
-  ]);
-});
+  const credentialsInput = toEncodedJSON(alwaysEnabledCredentials);
 
-test("getCredentials returns all credentials for Actions when using LANGUAGE_TO_REGISTRY_TYPE", async (t) => {
-  const credentialsInput = toEncodedJSON(mixedCredentials);
+  // Test all languages.
+  for (const language of Object.values(BuiltInLanguage)) {
+    const credentials = startProxyExports.getCredentials(
+      getRunnerLogger(true),
+      undefined,
+      credentialsInput,
+      language,
+    );
 
-  const credentials = startProxyExports.getCredentials(
-    getRunnerLogger(true),
-    undefined,
-    credentialsInput,
-    KnownLanguage.actions,
-    false,
-  );
-  t.is(credentials.length, mixedCredentials.length);
-});
-
-test("getCredentials returns no credentials for Actions when using NEW_LANGUAGE_TO_REGISTRY_TYPE", async (t) => {
-  const credentialsInput = toEncodedJSON(mixedCredentials);
-
-  const credentials = startProxyExports.getCredentials(
-    getRunnerLogger(true),
-    undefined,
-    credentialsInput,
-    KnownLanguage.actions,
-    true,
-  );
-  t.deepEqual(credentials, []);
-});
-
-test("parseLanguage", async (t) => {
-  // Exact matches
-  t.deepEqual(parseLanguage("csharp"), KnownLanguage.csharp);
-  t.deepEqual(parseLanguage("cpp"), KnownLanguage.cpp);
-  t.deepEqual(parseLanguage("go"), KnownLanguage.go);
-  t.deepEqual(parseLanguage("java"), KnownLanguage.java);
-  t.deepEqual(parseLanguage("javascript"), KnownLanguage.javascript);
-  t.deepEqual(parseLanguage("python"), KnownLanguage.python);
-  t.deepEqual(parseLanguage("rust"), KnownLanguage.rust);
-
-  // Aliases
-  t.deepEqual(parseLanguage("c"), KnownLanguage.cpp);
-  t.deepEqual(parseLanguage("c++"), KnownLanguage.cpp);
-  t.deepEqual(parseLanguage("c#"), KnownLanguage.csharp);
-  t.deepEqual(parseLanguage("kotlin"), KnownLanguage.java);
-  t.deepEqual(parseLanguage("typescript"), KnownLanguage.javascript);
-
-  // spaces and case-insensitivity
-  t.deepEqual(parseLanguage("  \t\nCsHaRp\t\t"), KnownLanguage.csharp);
-  t.deepEqual(parseLanguage("  \t\nkOtLin\t\t"), KnownLanguage.java);
-
-  // Not matches
-  t.deepEqual(parseLanguage("foo"), undefined);
-  t.deepEqual(parseLanguage(" "), undefined);
-  t.deepEqual(parseLanguage(""), undefined);
+    t.deepEqual(credentials, alwaysEnabledCredentials);
+  }
 });
 
 function mockGetApiClient(endpoints: any) {
@@ -664,7 +821,7 @@ test.serial(
   },
 );
 
-const wrapFailureTest = test.macro({
+const wrapFailureTest = makeMacro({
   exec: async (
     t: ExecutionContext<unknown>,
     setup: () => void,
@@ -695,9 +852,8 @@ test.serial("downloadProxy - returns file path on success", async (t) => {
   });
 });
 
-test.serial(
+wrapFailureTest.serial(
   "downloadProxy",
-  wrapFailureTest,
   () => {
     sinon.stub(toolcache, "downloadTool").throws();
   },
@@ -716,9 +872,8 @@ test.serial("extractProxy - returns file path on success", async (t) => {
   });
 });
 
-test.serial(
+wrapFailureTest.serial(
   "extractProxy",
-  wrapFailureTest,
   () => {
     sinon.stub(toolcache, "extractTar").throws();
   },
@@ -742,9 +897,8 @@ test.serial("cacheProxy - returns file path on success", async (t) => {
   });
 });
 
-test.serial(
+wrapFailureTest.serial(
   "cacheProxy",
-  wrapFailureTest,
   () => {
     sinon.stub(toolcache, "cacheDir").throws();
   },
@@ -887,8 +1041,10 @@ test.serial(
         return true;
       });
       const getDefaultCliVersion = sinon
-        .stub(features, "getDefaultCliVersion")
-        .resolves({ cliVersion: "2.20.1", tagName: expectedTag });
+        .stub(features, "getEnabledDefaultCliVersions")
+        .resolves({
+          enabledVersions: [{ cliVersion: "2.20.1", tagName: expectedTag }],
+        });
       const path = await startProxyExports.getProxyBinaryPath(logger, features);
 
       t.assert(getDefaultCliVersion.calledOnce);

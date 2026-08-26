@@ -21,7 +21,7 @@ import {
 import type { Config } from "./config-utils";
 import * as defaults from "./defaults.json";
 import { DocUrl } from "./doc-url";
-import { KnownLanguage } from "./languages";
+import { BuiltInLanguage } from "./languages";
 import { getRunnerLogger } from "./logging";
 import { ToolsSource } from "./setup-codeql";
 import {
@@ -33,6 +33,7 @@ import {
   mockBundleDownloadApi,
   makeVersionInfo,
   createTestConfig,
+  makeMacro,
 } from "./testing-utils";
 import { ToolsDownloadStatusReport } from "./tools-download";
 import * as util from "./util";
@@ -46,8 +47,33 @@ test.beforeEach(() => {
   initializeEnvironment("1.2.3");
 
   stubConfig = createTestConfig({
-    languages: [KnownLanguage.cpp],
+    languages: [BuiltInLanguage.cpp],
   });
+});
+
+test("isDiskConfigurationError - true for expected errors", async (t) => {
+  t.true(
+    codeql.isDiskConfigurationError(new Error("ENOSPC: Out of disk space")),
+  );
+  t.true(
+    codeql.isDiskConfigurationError(
+      new Error(
+        "EACCES: permission denied, mkdir /opt/hostedtoolcache/CodeQL/",
+      ),
+    ),
+  );
+});
+
+test("isDiskConfigurationError - false for other errors", async (t) => {
+  t.false(codeql.isDiskConfigurationError("Not an Error instance"));
+
+  const otherMessages = [
+    "Does not contain an error code we test for",
+    "ENOSP: Not quite the full error code",
+  ];
+  for (const otherMessage of otherMessages) {
+    t.false(codeql.isDiskConfigurationError(new Error(otherMessage)));
+  }
 });
 
 async function installIntoToolcache({
@@ -70,8 +96,10 @@ async function installIntoToolcache({
     tmpDir,
     util.GitHubVariant.GHES,
     cliVersion !== undefined
-      ? { cliVersion, tagName }
+      ? { enabledVersions: [{ cliVersion, tagName }] }
       : SAMPLE_DEFAULT_CLI_VERSION,
+    undefined, // rawLanguages
+    false, // useOverlayAwareDefaultCliVersion
     createFeatures([]),
     getRunnerLogger(true),
     false,
@@ -115,7 +143,7 @@ async function stubCodeql(): Promise<codeql.CodeQL> {
   sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
   sinon
     .stub(codeqlObject, "isTracedLanguage")
-    .withArgs(KnownLanguage.cpp)
+    .withArgs(BuiltInLanguage.cpp)
     .resolves(true);
   return codeqlObject;
 }
@@ -143,6 +171,8 @@ test.serial(
           tmpDir,
           util.GitHubVariant.DOTCOM,
           SAMPLE_DEFAULT_CLI_VERSION,
+          undefined, // rawLanguages
+          false, // useOverlayAwareDefaultCliVersion
           features,
           getRunnerLogger(true),
           false,
@@ -151,6 +181,7 @@ test.serial(
         t.assert(toolcache.find("CodeQL", `0.0.0-${version}`));
         t.is(result.toolsVersion, `0.0.0-${version}`);
         t.is(result.toolsSource, ToolsSource.Download);
+        assertDownloadDurationInteger(t, result.toolsDownloadStatusReport);
       }
 
       t.is(toolcache.findAllVersions("CodeQL").length, 2);
@@ -175,6 +206,8 @@ test.serial(
         tmpDir,
         util.GitHubVariant.DOTCOM,
         SAMPLE_DEFAULT_CLI_VERSION,
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
@@ -184,9 +217,7 @@ test.serial(
       t.assert(toolcache.find("CodeQL", `2.15.0`));
       t.is(result.toolsVersion, `2.15.0`);
       t.is(result.toolsSource, ToolsSource.Download);
-      if (result.toolsDownloadStatusReport) {
-        assertDurationsInteger(t, result.toolsDownloadStatusReport);
-      }
+      assertDownloadDurationInteger(t, result.toolsDownloadStatusReport);
     });
   },
 );
@@ -214,6 +245,8 @@ test.serial(
         tmpDir,
         util.GitHubVariant.DOTCOM,
         SAMPLE_DEFAULT_CLI_VERSION,
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
@@ -221,9 +254,7 @@ test.serial(
       t.assert(toolcache.find("CodeQL", "0.0.0-20200610"));
       t.deepEqual(result.toolsVersion, "0.0.0-20200610");
       t.is(result.toolsSource, ToolsSource.Download);
-      if (result.toolsDownloadStatusReport) {
-        assertDurationsInteger(t, result.toolsDownloadStatusReport);
-      }
+      assertDownloadDurationInteger(t, result.toolsDownloadStatusReport);
     });
   },
 );
@@ -264,6 +295,8 @@ for (const {
           tmpDir,
           util.GitHubVariant.DOTCOM,
           SAMPLE_DEFAULT_CLI_VERSION,
+          undefined, // rawLanguages
+          false, // useOverlayAwareDefaultCliVersion
           features,
           getRunnerLogger(true),
           false,
@@ -271,11 +304,7 @@ for (const {
         t.assert(toolcache.find("CodeQL", expectedToolcacheVersion));
         t.deepEqual(result.toolsVersion, expectedToolcacheVersion);
         t.is(result.toolsSource, ToolsSource.Download);
-        t.assert(
-          Number.isInteger(
-            result.toolsDownloadStatusReport?.downloadDurationMs,
-          ),
-        );
+        assertDownloadDurationInteger(t, result.toolsDownloadStatusReport);
       });
     },
   );
@@ -284,11 +313,11 @@ for (const {
 for (const toolcacheVersion of [
   // Test that we use the tools from the toolcache when `SAMPLE_DEFAULT_CLI_VERSION` is requested
   // and `SAMPLE_DEFAULT_CLI_VERSION-` is in the toolcache.
-  SAMPLE_DEFAULT_CLI_VERSION.cliVersion,
-  `${SAMPLE_DEFAULT_CLI_VERSION.cliVersion}-20230101`,
+  SAMPLE_DEFAULT_CLI_VERSION.enabledVersions[0].cliVersion,
+  `${SAMPLE_DEFAULT_CLI_VERSION.enabledVersions[0].cliVersion}-20230101`,
 ]) {
   test.serial(
-    `uses tools from toolcache when ${SAMPLE_DEFAULT_CLI_VERSION.cliVersion} is requested and ` +
+    `uses tools from toolcache when ${SAMPLE_DEFAULT_CLI_VERSION.enabledVersions[0].cliVersion} is requested and ` +
       `${toolcacheVersion} is installed`,
     async (t) => {
       const features = createFeatures([]);
@@ -308,15 +337,18 @@ for (const toolcacheVersion of [
           tmpDir,
           util.GitHubVariant.DOTCOM,
           SAMPLE_DEFAULT_CLI_VERSION,
+          undefined, // rawLanguages
+          false, // useOverlayAwareDefaultCliVersion
           features,
           getRunnerLogger(true),
           false,
         );
-        t.is(result.toolsVersion, SAMPLE_DEFAULT_CLI_VERSION.cliVersion);
+        t.is(
+          result.toolsVersion,
+          SAMPLE_DEFAULT_CLI_VERSION.enabledVersions[0].cliVersion,
+        );
         t.is(result.toolsSource, ToolsSource.Toolcache);
-        t.is(result.toolsDownloadStatusReport?.combinedDurationMs, undefined);
-        t.is(result.toolsDownloadStatusReport?.downloadDurationMs, undefined);
-        t.is(result.toolsDownloadStatusReport?.extractionDurationMs, undefined);
+        t.is(result.toolsDownloadStatusReport, undefined);
       });
     },
   );
@@ -342,18 +374,22 @@ test.serial(
         tmpDir,
         util.GitHubVariant.GHES,
         {
-          cliVersion: defaults.cliVersion,
-          tagName: defaults.bundleVersion,
+          enabledVersions: [
+            {
+              cliVersion: defaults.cliVersion,
+              tagName: defaults.bundleVersion,
+            },
+          ],
         },
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
       );
       t.deepEqual(result.toolsVersion, "0.0.0-20200601");
       t.is(result.toolsSource, ToolsSource.Toolcache);
-      t.is(result.toolsDownloadStatusReport?.combinedDurationMs, undefined);
-      t.is(result.toolsDownloadStatusReport?.downloadDurationMs, undefined);
-      t.is(result.toolsDownloadStatusReport?.extractionDurationMs, undefined);
+      t.is(result.toolsDownloadStatusReport, undefined);
 
       const cachedVersions = toolcache.findAllVersions("CodeQL");
       t.is(cachedVersions.length, 1);
@@ -384,18 +420,22 @@ test.serial(
         tmpDir,
         util.GitHubVariant.GHES,
         {
-          cliVersion: defaults.cliVersion,
-          tagName: defaults.bundleVersion,
+          enabledVersions: [
+            {
+              cliVersion: defaults.cliVersion,
+              tagName: defaults.bundleVersion,
+            },
+          ],
         },
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
       );
       t.deepEqual(result.toolsVersion, defaults.cliVersion);
       t.is(result.toolsSource, ToolsSource.Download);
-      if (result.toolsDownloadStatusReport) {
-        assertDurationsInteger(t, result.toolsDownloadStatusReport);
-      }
+      t.truthy(result.toolsDownloadStatusReport);
 
       const cachedVersions = toolcache.findAllVersions("CodeQL");
       t.is(cachedVersions.length, 2);
@@ -426,15 +466,15 @@ test.serial(
         tmpDir,
         util.GitHubVariant.DOTCOM,
         SAMPLE_DEFAULT_CLI_VERSION,
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
       );
       t.deepEqual(result.toolsVersion, defaults.cliVersion);
       t.is(result.toolsSource, ToolsSource.Download);
-      if (result.toolsDownloadStatusReport) {
-        assertDurationsInteger(t, result.toolsDownloadStatusReport);
-      }
+      t.truthy(result.toolsDownloadStatusReport);
 
       const cachedVersions = toolcache.findAllVersions("CodeQL");
       t.is(cachedVersions.length, 2);
@@ -467,6 +507,8 @@ test.serial(
         tmpDir,
         util.GitHubVariant.DOTCOM,
         SAMPLE_DEFAULT_CLI_VERSION,
+        undefined, // rawLanguages
+        false, // useOverlayAwareDefaultCliVersion
         features,
         getRunnerLogger(true),
         false,
@@ -474,9 +516,7 @@ test.serial(
 
       t.is(result.toolsVersion, "0.0.0-20230203");
       t.is(result.toolsSource, ToolsSource.Download);
-      if (result.toolsDownloadStatusReport) {
-        assertDurationsInteger(t, result.toolsDownloadStatusReport);
-      }
+      assertDownloadDurationInteger(t, result.toolsDownloadStatusReport);
 
       const cachedVersions = toolcache.findAllVersions("CodeQL");
       t.is(cachedVersions.length, 1);
@@ -487,15 +527,11 @@ test.serial(
   },
 );
 
-function assertDurationsInteger(
+function assertDownloadDurationInteger(
   t: ExecutionContext<unknown>,
-  statusReport: ToolsDownloadStatusReport,
+  statusReport: ToolsDownloadStatusReport | undefined,
 ) {
-  t.assert(Number.isInteger(statusReport?.combinedDurationMs));
-  if (statusReport.downloadDurationMs !== undefined) {
-    t.assert(Number.isInteger(statusReport?.downloadDurationMs));
-    t.assert(Number.isInteger(statusReport?.extractionDurationMs));
-  }
+  t.assert(Number.isInteger(statusReport?.downloadDurationMs));
 }
 
 test.serial("getExtraOptions works for explicit paths", (t) => {
@@ -540,7 +576,7 @@ test.serial("getExtraOptions throws for bad content", (t) => {
 });
 
 // Test macro for ensuring different variants of injected augmented configurations
-const injectedConfigMacro = test.macro({
+const injectedConfigMacro = makeMacro({
   exec: async (
     t: ExecutionContext<unknown>,
     augmentationProperties: AugmentationProperties,
@@ -569,7 +605,6 @@ const injectedConfigMacro = test.macro({
         "",
         undefined,
         undefined,
-        getRunnerLogger(true),
       );
 
       const args = runnerConstructorStub.firstCall.args[1] as string[];
@@ -590,9 +625,8 @@ const injectedConfigMacro = test.macro({
     `databaseInitCluster() injected config: ${providedTitle}`,
 });
 
-test.serial(
+injectedConfigMacro.serial(
   "basic",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
   },
@@ -600,9 +634,8 @@ test.serial(
   {},
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected packs from input",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     packsInput: ["xxx", "yyy"],
@@ -613,9 +646,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected packs from input with existing packs combines",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     packsInputCombines: true,
@@ -635,9 +667,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected packs from input with existing packs overrides",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     packsInput: ["xxx", "yyy"],
@@ -655,9 +686,8 @@ test.serial(
 );
 
 // similar, but with queries
-test.serial(
+injectedConfigMacro.serial(
   "injected queries from input",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -675,9 +705,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected queries from input overrides",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInput: [{ uses: "xxx" }, { uses: "yyy" }],
@@ -699,9 +728,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected queries from input combines",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: true,
@@ -727,9 +755,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected queries from input combines 2",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: true,
@@ -749,9 +776,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "injected queries and packs, but empty",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: true,
@@ -768,9 +794,8 @@ test.serial(
   {},
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "repo property queries have the highest precedence",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: true,
@@ -790,9 +815,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "repo property queries combines with queries input",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: false,
@@ -817,9 +841,8 @@ test.serial(
   },
 );
 
-test.serial(
+injectedConfigMacro.serial(
   "repo property queries combines everything else",
-  injectedConfigMacro,
   {
     ...defaultAugmentationProperties,
     queriesInputCombines: true,
@@ -857,7 +880,6 @@ test.serial(
         "",
         undefined,
         "/path/to/qlconfig.yml",
-        getRunnerLogger(true),
       );
 
       const args = runnerConstructorStub.firstCall.args[1] as string[];
@@ -888,7 +910,6 @@ test.serial(
         "",
         undefined,
         undefined, // undefined qlconfigFile
-        getRunnerLogger(true),
       );
 
       const args = runnerConstructorStub.firstCall.args[1] as any[];
@@ -956,7 +977,8 @@ test.serial("runTool summarizes autobuilder errors", async (t) => {
   sinon.stub(io, "which").resolves("");
 
   await t.throwsAsync(
-    async () => await codeqlObject.runAutobuild(stubConfig, KnownLanguage.java),
+    async () =>
+      await codeqlObject.runAutobuild(stubConfig, BuiltInLanguage.java),
     {
       instanceOf: util.ConfigurationError,
       message:
@@ -982,7 +1004,8 @@ test.serial("runTool truncates long autobuilder errors", async (t) => {
   sinon.stub(io, "which").resolves("");
 
   await t.throwsAsync(
-    async () => await codeqlObject.runAutobuild(stubConfig, KnownLanguage.java),
+    async () =>
+      await codeqlObject.runAutobuild(stubConfig, BuiltInLanguage.java),
     {
       instanceOf: util.ConfigurationError,
       message:
@@ -1050,7 +1073,7 @@ test.serial(
 );
 
 test.serial(
-  "Avoids duplicating --overwrite flag if specified in CODEQL_ACTION_EXTRA_OPTIONS",
+  "Avoids duplicating --force-overwrite flag if specified in CODEQL_ACTION_EXTRA_OPTIONS",
   async (t) => {
     const runnerConstructorStub = stubToolRunnerConstructor();
     const codeqlObject = await stubCodeql();
@@ -1058,22 +1081,21 @@ test.serial(
     sinon.stub(io, "which").resolves("");
 
     process.env["CODEQL_ACTION_EXTRA_OPTIONS"] =
-      '{ "database": { "init": ["--overwrite"] } }';
+      '{ "database": { "init": ["--force-overwrite"] } }';
 
     await codeqlObject.databaseInitCluster(
       stubConfig,
       "sourceRoot",
       undefined,
       undefined,
-      getRunnerLogger(false),
     );
 
     t.true(runnerConstructorStub.calledOnce);
     const args = runnerConstructorStub.firstCall.args[1] as string[];
     t.is(
-      args.filter((option: string) => option === "--overwrite").length,
+      args.filter((option: string) => option === "--force-overwrite").length,
       1,
-      "--overwrite should only be passed once",
+      "--force-overwrite should only be passed once",
     );
 
     // Clean up

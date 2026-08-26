@@ -4,6 +4,7 @@ import { performance } from "perf_hooks";
 
 import * as core from "@actions/core";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import * as actionsUtil from "./actions-util";
 import * as analyses from "./analyses";
 import {
@@ -28,12 +29,11 @@ import {
   DependencyCacheUploadStatusReport,
   uploadDependencyCaches,
 } from "./dependency-caching";
-import { getDiffInformedAnalysisBranches } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
 import { initFeatures } from "./feature-flags";
-import { KnownLanguage } from "./languages";
+import { BuiltInLanguage } from "./languages";
 import { getActionsLogger, Logger } from "./logging";
-import { cleanupAndUploadOverlayBaseDatabaseToCache } from "./overlay";
+import { cleanupAndUploadOverlayBaseDatabaseToCache } from "./overlay/caching";
 import { getRepositoryNwo } from "./repository";
 import * as statusReport from "./status-report";
 import {
@@ -41,7 +41,6 @@ import {
   createStatusReportBase,
   DatabaseCreationTimings,
   getActionsStatus,
-  sendUnhandledErrorStatusReport,
   StatusReportBase,
 } from "./status-report";
 import {
@@ -136,9 +135,13 @@ function hasBadExpectErrorInput(): boolean {
 function doesGoExtractionOutputExist(config: Config): boolean {
   const golangDbDirectory = util.getCodeQLDatabasePath(
     config,
-    KnownLanguage.go,
+    BuiltInLanguage.go,
   );
-  const trapDirectory = path.join(golangDbDirectory, "trap", KnownLanguage.go);
+  const trapDirectory = path.join(
+    golangDbDirectory,
+    "trap",
+    BuiltInLanguage.go,
+  );
   return (
     fs.existsSync(trapDirectory) &&
     fs
@@ -170,7 +173,7 @@ function doesGoExtractionOutputExist(config: Config): boolean {
  * whether any extraction output already exists for Go.
  */
 async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
-  if (!config.languages.includes(KnownLanguage.go)) {
+  if (!config.languages.includes(BuiltInLanguage.go)) {
     return;
   }
   if (config.buildMode) {
@@ -183,7 +186,7 @@ async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
     logger.debug("Won't run Go autobuild since it has already been run.");
     return;
   }
-  if (dbIsFinalized(config, KnownLanguage.go, logger)) {
+  if (dbIsFinalized(config, BuiltInLanguage.go, logger)) {
     logger.debug(
       "Won't run Go autobuild since there is already a finalized database for Go.",
     );
@@ -206,10 +209,10 @@ async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
   logger.debug(
     "Running Go autobuild because extraction output (TRAP files) for Go code has not been found.",
   );
-  await runAutobuild(config, KnownLanguage.go, logger);
+  await runAutobuild(config, BuiltInLanguage.go, logger);
 }
 
-async function run(startedAt: Date) {
+async function run({ startedAt, logger }: ActionState<["Base", "Logger"]>) {
   // To capture errors appropriately, keep as much code within the try-catch as
   // possible, and only use safe functions outside.
 
@@ -225,7 +228,6 @@ async function run(startedAt: Date) {
   let didUploadTrapCaches = false;
   let dependencyCacheResults: DependencyCacheUploadStatusReport | undefined;
   let databaseUploadResults: DatabaseUploadResult[] = [];
-  const logger = getActionsLogger();
 
   try {
     util.initializeEnvironment(actionsUtil.getActionVersion());
@@ -253,7 +255,7 @@ async function run(startedAt: Date) {
       );
     }
 
-    const codeql = await getCodeQL(config.codeQLCmd);
+    const codeql = await getCodeQL(logger, config.codeQLCmd);
 
     if (hasBadExpectErrorInput()) {
       throw new util.ConfigurationError(
@@ -305,14 +307,8 @@ async function run(startedAt: Date) {
       logger,
     );
 
-    const branches = await getDiffInformedAnalysisBranches(
-      codeql,
-      features,
-      logger,
-    );
-    const diffRangePackDir = branches
-      ? await setupDiffInformedQueryRun(branches, logger)
-      : undefined;
+    // Setup diff informed analysis if needed (based on whether init created the file)
+    const diffRangePackDir = await setupDiffInformedQueryRun(logger);
 
     await warnIfGoInstalledAfterInit(config, logger);
     await runAutobuildIfLegacyGoWorkflow(config, logger);
@@ -526,24 +522,13 @@ async function run(startedAt: Date) {
   }
 }
 
-// Module-level startedAt so it can be accessed by runWrapper for error reporting
-const startedAt = new Date();
-export const runPromise = run(startedAt);
+/** Defines the `analyze` Action. */
+const analyze: Action = {
+  name: ActionName.Analyze,
+  run,
+};
 
-async function runWrapper() {
-  const logger = getActionsLogger();
-  try {
-    await runPromise;
-  } catch (error) {
-    core.setFailed(`analyze action failed: ${util.getErrorMessage(error)}`);
-    await sendUnhandledErrorStatusReport(
-      ActionName.Analyze,
-      startedAt,
-      error,
-      logger,
-    );
-  }
+export async function runWrapper() {
+  await runInActions(analyze);
   await util.checkForTimeout();
 }
-
-void runWrapper();

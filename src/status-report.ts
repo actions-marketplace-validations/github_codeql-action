@@ -1,7 +1,9 @@
 import * as os from "os";
 
 import * as core from "@actions/core";
+import * as uuid from "uuid";
 
+import type { ActionState } from "./action-common";
 import {
   getWorkflowEventName,
   getOptionalInput,
@@ -12,19 +14,23 @@ import {
   isSelfHostedRunner,
 } from "./actions-util";
 import { getAnalysisKey, getApiClient } from "./api-client";
-import { parseRegistriesWithoutCredentials, type Config } from "./config-utils";
-import { DependencyCacheRestoreStatusReport } from "./dependency-caching";
+import { getCachedCodeQlVersion } from "./cli/output-cache";
+import type { Config } from "./config/action-config";
+import type { ComputedInput, InputName } from "./config/inputs";
+import { parseRegistriesWithoutCredentials } from "./config/pack-registries";
+import type { DependencyCacheRestoreStatusReport } from "./dependency-caching";
 import { DocUrl } from "./doc-url";
-import { EnvVar } from "./environment";
+import { EnvVar, getEnv, ReadOnlyEnv, RegistryProxyVars } from "./environment";
 import { getRef } from "./git-utils";
-import { Logger } from "./logging";
-import { OverlayBaseDatabaseDownloadStats } from "./overlay";
+import * as json from "./json";
+import type { Logger } from "./logging";
+import type { OverlayBaseDatabaseDownloadStats } from "./overlay/caching";
 import { getRepositoryNwo } from "./repository";
-import { ToolsSource } from "./setup-codeql";
+import type { ToolsSource } from "./setup-codeql";
+import { registryBaseSchema } from "./start-proxy/types";
 import {
   ConfigurationError,
   getRequiredEnvParam,
-  getCachedCodeQlVersion,
   isInTestMode,
   GITHUB_DOTCOM_URL,
   DiskUsage,
@@ -44,6 +50,41 @@ export enum ActionName {
   SetupCodeQL = "setup-codeql",
   StartProxy = "start-proxy",
   UploadSarif = "upload-sarif",
+}
+
+/**
+ * Maps an `ActionName` to its display name. Usually that is the same, except
+ * for `ActionName.Analyze` where it is `"analyze"` instead of `"finish"`.
+ */
+export function getDisplayActionName(actionName: ActionName): string {
+  if (actionName === ActionName.Analyze) {
+    return "analyze";
+  }
+  return actionName;
+}
+
+/**
+ * Either creates a UUIDv4 for the analysis or retrieves an existing one from the
+ * environment and returns it.
+ * If a new UUID is generated, it is also exported as an environment variable.
+ */
+export function getJobUUID(
+  action: ActionState<["Logger", "ReadOnlyEnv", "Actions"]>,
+) {
+  // Check if we already have a UUID for the analysis and return it if so.
+  const existingJobRunUuid = action.env.getOptional(EnvVar.JOB_RUN_UUID);
+
+  if (existingJobRunUuid !== undefined && uuid.validate(existingJobRunUuid)) {
+    action.logger.info(`Existing job run UUID is ${existingJobRunUuid}.`);
+    return existingJobRunUuid;
+  }
+
+  // Otherwise generate a new UUID.
+  const jobRunUuid = uuid.v4();
+  action.logger.info(`Job run UUID is ${jobRunUuid}.`);
+
+  action.actions.exportVariable(EnvVar.JOB_RUN_UUID, jobRunUuid);
+  return jobRunUuid;
 }
 
 /**
@@ -110,6 +151,8 @@ export interface StatusReportBase {
   commit_oid: string;
   /** Time this action completed, or undefined if not yet completed. */
   completed_at?: string;
+  /** A mapping of input names to their computed values. */
+  computed_inputs: Partial<Record<InputName, ComputedInput>>;
   /** Stack trace of the failure (or undefined if status is not failure). */
   exception?: string;
   /** Whether this is a first-party (CodeQL) run of the action. */
@@ -144,6 +187,12 @@ export interface StatusReportBase {
   ml_powered_javascript_queries?: string;
   /** Ref that the workflow was triggered on. */
   ref: string;
+  /**
+   * A comma-separated list of private registry types which are configured for CodeQL.
+   * This only includes registry types we support (as determined by the `start-proxy` action),
+   * not all that are configured.
+   */
+  registry_types?: string;
   /** Action runner hardware architecture (context runner.arch). */
   runner_arch?: string;
   /** Available disk space on the runner, in bytes. */
@@ -248,6 +297,50 @@ export interface EventReport {
 }
 
 /**
+ * Attempts to retrieve a list of private registry types from the `CODEQL_PROXY_URLS` environment
+ * variable and returns it as a comma-separated string if successful. Returns `undefined` otherwise.
+ */
+export function getRegistryTypesFromEnv(
+  logger: Logger,
+  env: ReadOnlyEnv = getEnv(),
+): string | undefined {
+  // Try to get the value of the environment variable.
+  const value = env.getOptional(RegistryProxyVars.PROXY_URLS);
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  // Try to parse the JSON we expect to find in it and return the comma-separated list of
+  // (unique) registry types.
+  try {
+    const data = JSON.parse(value) as unknown;
+
+    // Check that the parsed JSON meets our expectations.
+    if (!json.isArray(data)) {
+      logger.debug(
+        `Expected '${RegistryProxyVars.PROXY_URLS}' to contain a JSON array, but got '${typeof data}'.`,
+      );
+      return undefined;
+    }
+    if (!json.validateArray(registryBaseSchema, data)) {
+      logger.debug(
+        `Expected '${RegistryProxyVars.PROXY_URLS}' to contain a JSON array of registry objects, but got something else.`,
+      );
+      return undefined;
+    }
+
+    const types = new Set(data.map((r) => r.type));
+    return Array.from(types).sort().join(",");
+  } catch (err) {
+    logger.debug(
+      `Failed to parse '${RegistryProxyVars.PROXY_URLS}': ${getErrorMessage(err)}.`,
+    );
+    return undefined;
+  }
+}
+
+/**
  * Compose a StatusReport.
  *
  * @param actionName The name of the action, e.g. 'init', 'finish', 'upload-sarif'
@@ -283,7 +376,7 @@ export async function createStatusReportBase(
       core.exportVariable(EnvVar.WORKFLOW_STARTED_AT, workflowStartedAt);
     }
     const runnerOs = getRequiredEnvParam("RUNNER_OS");
-    const codeQlCliVersion = getCachedCodeQlVersion();
+    const codeQlCliVersion = getCachedCodeQlVersion(logger, getEnv());
     const actionRef = process.env["GITHUB_ACTION_REF"] || "";
     const testingEnvironment = getTestingEnvironment();
     // re-export the testing environment variable so that it is available to subsequent steps,
@@ -304,10 +397,12 @@ export async function createStatusReportBase(
       analysis_key,
       build_mode: config?.buildMode,
       commit_oid: commitOid,
+      computed_inputs: {},
       first_party_analysis: isFirstPartyAnalysis(actionName),
       job_name: jobName,
       job_run_uuid: jobRunUUID,
       ref,
+      registry_types: getRegistryTypesFromEnv(logger),
       runner_os: runnerOs,
       started_at: workflowStartedAt,
       status,

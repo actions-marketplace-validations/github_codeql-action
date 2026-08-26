@@ -9,7 +9,7 @@ on:
       - main
     paths:
       - .github/workflows/update-supported-enterprise-server-versions.yml
-      - .github/workflows/update-supported-enterprise-server-versions/update.py
+      - pr-checks/update-ghes-versions.ts
 
 jobs:
   update-supported-enterprise-server-versions:
@@ -22,30 +22,36 @@ jobs:
       pull-requests: write # needed to create pull request
 
     steps:
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
       - name: Checkout CodeQL Action
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Checkout Enterprise Releases
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: github/enterprise-releases
-          token: ${{ secrets.ENTERPRISE_RELEASE_TOKEN }}
+          token: ${{ secrets.CODEQL_CI_ENTERPRISE_RELEASE_PAT }}
           path: ${{ github.workspace }}/enterprise-releases/
           sparse-checkout: releases.json
+
       - name: Update Supported Enterprise Server Versions
+        working-directory: pr-checks
         run: |
-          cd ./.github/workflows/update-supported-enterprise-server-versions/
-          python3 -m pip install pipenv
-          pipenv install
-          pipenv run ./update.py
+          npx tsx update-ghes-versions.ts
           rm --recursive "$ENTERPRISE_RELEASES_PATH"
-          npm ci
-          npm run build
         env:
           ENTERPRISE_RELEASES_PATH: ${{ github.workspace }}/enterprise-releases/
+
+      - name: Rebuild
+        run: npm run build
 
       - name: Update git config
         run: |

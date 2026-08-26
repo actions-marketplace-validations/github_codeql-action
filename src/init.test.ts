@@ -8,6 +8,7 @@ import * as sinon from "sinon";
 
 import * as actionsUtil from "./actions-util";
 import { createStubCodeQL } from "./codeql";
+import { ActionsEnvVars } from "./environment";
 import { Feature } from "./feature-flags";
 import {
   checkPacksForOverlayCompatibility,
@@ -15,13 +16,14 @@ import {
   getFileCoverageInformationEnabled,
   logFileCoverageOnPrsDeprecationWarning,
 } from "./init";
-import { KnownLanguage } from "./languages";
+import { BuiltInLanguage } from "./languages";
 import {
   createFeatures,
   LoggedMessage,
   createTestConfig,
   getRecordingLogger,
   setupTests,
+  makeMacro,
 } from "./testing-utils";
 import { ConfigurationError, withTmpDir } from "./util";
 
@@ -83,7 +85,7 @@ for (const { runnerEnv, ErrorConstructor, message } of [
     `cleanupDatabaseClusterDirectory throws a ${ErrorConstructor.name} when cleanup fails on ${runnerEnv} runner`,
     async (t) => {
       await withTmpDir(async (tmpDir: string) => {
-        process.env["RUNNER_ENVIRONMENT"] = runnerEnv;
+        process.env[ActionsEnvVars.RUNNER_ENVIRONMENT] = runnerEnv;
 
         const dbLocation = path.resolve(tmpDir, "dbs");
         fs.mkdirSync(dbLocation, { recursive: true });
@@ -152,16 +154,15 @@ test("cleanupDatabaseClusterDirectory can disable warning with options", async (
 });
 
 type PackInfo = {
-  language: KnownLanguage;
+  language: BuiltInLanguage;
   packinfoContents: string | undefined;
   sourceOnlyPack?: boolean;
   qlpackFileName?: string;
 };
 
-const testCheckPacksForOverlayCompatibility = test.macro({
+const testCheckPacksForOverlayCompatibility = makeMacro({
   exec: async (
     t: ExecutionContext,
-    _title: string,
     {
       cliOverlayVersion,
       languages,
@@ -169,13 +170,13 @@ const testCheckPacksForOverlayCompatibility = test.macro({
       expectedResult,
     }: {
       cliOverlayVersion: number | undefined;
-      languages: KnownLanguage[];
+      languages: BuiltInLanguage[];
       packs: Record<string, PackInfo>;
       expectedResult: boolean;
     },
   ) => {
     await withTmpDir(async (tmpDir) => {
-      const packDirsByLanguage = new Map<KnownLanguage, string[]>();
+      const packDirsByLanguage = new Map<BuiltInLanguage, string[]>();
 
       for (const [packName, packInfo] of Object.entries(packs)) {
         const packPath = path.join(tmpDir, packName);
@@ -234,18 +235,17 @@ const testCheckPacksForOverlayCompatibility = test.macro({
       );
     });
   },
-  title: (_, title) => `checkPacksForOverlayCompatibility: ${title}`,
+  title: (title) => `checkPacksForOverlayCompatibility: ${title}`,
 });
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when CLI does not support overlay",
   {
     cliOverlayVersion: undefined,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
     },
@@ -253,26 +253,24 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when there are no query packs",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {},
     expectedResult: true,
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when query pack has not been compiled",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: undefined,
         sourceOnlyPack: true,
       },
@@ -281,15 +279,14 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when query pack has expected overlay version",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
     },
@@ -297,19 +294,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when query packs for all languages to analyze are compatible",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.cpp, KnownLanguage.java],
+    languages: [BuiltInLanguage.cpp, BuiltInLanguage.java],
     packs: {
       "codeql/cpp-queries": {
-        language: KnownLanguage.cpp,
+        language: BuiltInLanguage.cpp,
         packinfoContents: '{"overlayVersion":2}',
       },
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
     },
@@ -317,19 +313,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when query pack for a language not analyzed is incompatible",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/cpp-queries": {
-        language: KnownLanguage.cpp,
+        language: BuiltInLanguage.cpp,
         packinfoContents: undefined,
       },
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
     },
@@ -337,19 +332,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when query pack for a language to analyze is incompatible",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.cpp, KnownLanguage.java],
+    languages: [BuiltInLanguage.cpp, BuiltInLanguage.java],
     packs: {
       "codeql/cpp-queries": {
-        language: KnownLanguage.cpp,
+        language: BuiltInLanguage.cpp,
         packinfoContents: '{"overlayVersion":1}',
       },
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
     },
@@ -357,19 +351,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when query pack is missing .packinfo",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
       "custom/queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: undefined,
       },
     },
@@ -377,19 +370,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when query pack has different overlay version",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
       "custom/queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":1}',
       },
     },
@@ -397,19 +389,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when query pack is missing overlayVersion in .packinfo",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
       "custom/queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: "{}",
       },
     },
@@ -417,19 +408,18 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns false when .packinfo is not valid JSON",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
       },
       "custom/queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: "this_is_not_valid_json",
       },
     },
@@ -437,15 +427,14 @@ test(
   },
 );
 
-test(
-  testCheckPacksForOverlayCompatibility,
+testCheckPacksForOverlayCompatibility(
   "returns true when query pack uses codeql-pack.yml filename",
   {
     cliOverlayVersion: 2,
-    languages: [KnownLanguage.java],
+    languages: [BuiltInLanguage.java],
     packs: {
       "codeql/java-queries": {
-        language: KnownLanguage.java,
+        language: BuiltInLanguage.java,
         packinfoContents: '{"overlayVersion":2}',
         qlpackFileName: "codeql-pack.yml",
       },

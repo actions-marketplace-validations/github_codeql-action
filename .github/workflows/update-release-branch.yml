@@ -26,7 +26,7 @@ jobs:
 
   update:
     timeout-minutes: 45
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
     needs: [prepare]
     env:
@@ -38,7 +38,7 @@ jobs:
       contents: write # needed to push commits
       pull-requests: write # needed to create pull request
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0  # Need full history for calculation of diffs
     - uses: ./.github/actions/release-initialise
@@ -64,11 +64,12 @@ jobs:
 
     - name: Update current release branch
       if: github.event_name == 'workflow_dispatch'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         echo SOURCE_BRANCH=${REF_NAME}
         echo TARGET_BRANCH=releases/${MAJOR_VERSION}
-        python .github/update-release-branch.py \
-          --github-token ${{ secrets.GITHUB_TOKEN }} \
+        npx tsx ./pr-checks/update-release-branch.ts \
           --repository-nwo ${{ github.repository }} \
           --source-branch '${{ env.REF_NAME }}' \
           --target-branch 'releases/${{ env.MAJOR_VERSION }}' \
@@ -77,7 +78,7 @@ jobs:
 
   backport:
     timeout-minutes: 45
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     environment: Automation
     needs: [prepare]
     if: ${{ (github.event_name == 'push') && needs.prepare.outputs.backport_target_branches != '[]' }}
@@ -93,25 +94,26 @@ jobs:
       pull-requests: write # needed to create pull request
     steps:
     - name: Generate token
-      uses: actions/create-github-app-token@v3.0.0
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
       id: app-token
       with:
         app-id: ${{ vars.AUTOMATION_APP_ID }}
         private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
 
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0  # Need full history for calculation of diffs
         token: ${{ steps.app-token.outputs.token }}
     - uses: ./.github/actions/release-initialise
 
     - name: Update older release branch
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         echo SOURCE_BRANCH=${SOURCE_BRANCH}
         echo TARGET_BRANCH=${TARGET_BRANCH}
-        python .github/update-release-branch.py \
-          --github-token ${{ secrets.GITHUB_TOKEN }} \
+        npx tsx ./pr-checks/update-release-branch.ts \
           --repository-nwo ${{ github.repository }} \
           --source-branch ${SOURCE_BRANCH} \
           --target-branch ${TARGET_BRANCH} \

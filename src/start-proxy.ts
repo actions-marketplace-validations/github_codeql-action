@@ -18,26 +18,18 @@ import {
   FeatureEnablement,
 } from "./feature-flags";
 import * as json from "./json";
-import { KnownLanguage } from "./languages";
+import { BuiltInLanguage } from "./languages";
 import { Logger } from "./logging";
 import {
   Address,
   Registry,
   Credential,
-  AuthConfig,
-  isToken,
-  isAzureConfig,
-  Token,
-  UsernamePassword,
-  AzureConfig,
-  isAWSConfig,
-  AWSConfig,
-  isJFrogConfig,
-  JFrogConfig,
-  isUsernamePassword,
+  hasToken,
+  hasUsernameAndPassword,
   hasUsername,
   RawCredential,
 } from "./start-proxy/types";
+import { getAuthConfig } from "./start-proxy/validation";
 import {
   ActionName,
   createStatusReportBase,
@@ -91,12 +83,6 @@ export class StartProxyError extends Error {
   }
 }
 
-interface StartProxyStatus extends StatusReportBase {
-  // A comma-separated list of registry types which are configured for CodeQL.
-  // This only includes registry types we support, not all that are configured.
-  registry_types: string;
-}
-
 /**
  * Sends a status report for the `start-proxy` action indicating a successful outcome.
  *
@@ -120,7 +106,7 @@ export async function sendSuccessStatusReport(
     logger,
   );
   if (statusReportBase !== undefined) {
-    const statusReport: StartProxyStatus = {
+    const statusReport: StatusReportBase = {
       ...statusReportBase,
       registry_types: registry_types.join(","),
     };
@@ -156,7 +142,7 @@ export function getSafeErrorMessage(error: Error): string {
 export async function sendFailedStatusReport(
   logger: Logger,
   startedAt: Date,
-  language: KnownLanguage | undefined,
+  language: BuiltInLanguage | undefined,
   unwrappedError: unknown,
 ) {
   const error = util.wrapError(unwrappedError);
@@ -172,7 +158,7 @@ export async function sendFailedStatusReport(
     getActionsStatus(error),
     startedAt,
     {
-      languages: language && [language],
+      languages: language === undefined ? undefined : [language],
     },
     await util.checkDiskUsage(logger),
     logger,
@@ -188,48 +174,6 @@ export const UPDATEJOB_PROXY_VERSION = "v2.0.20250624110901";
 const UPDATEJOB_PROXY_URL_PREFIX =
   "https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.22.0/";
 
-/*
- * Language aliases supported by the start-proxy Action.
- *
- * In general, the CodeQL CLI is the source of truth for language aliases, and to
- * allow us to more easily support new languages, we want to avoid hardcoding these
- * aliases in the Action itself.  However this is difficult to do in the start-proxy
- * Action since this Action does not use CodeQL, so we're accepting some hardcoding
- * for this Action.
- */
-const LANGUAGE_ALIASES: { [lang: string]: KnownLanguage } = {
-  c: KnownLanguage.cpp,
-  "c++": KnownLanguage.cpp,
-  "c#": KnownLanguage.csharp,
-  kotlin: KnownLanguage.java,
-  typescript: KnownLanguage.javascript,
-  "javascript-typescript": KnownLanguage.javascript,
-  "java-kotlin": KnownLanguage.java,
-};
-
-/**
- * Parse the start-proxy language input into its canonical CodeQL language name.
- *
- * Exported for testing. Do not use this outside of the start-proxy Action
- * to avoid complicating the process of adding new CodeQL languages.
- */
-export function parseLanguage(language: string): KnownLanguage | undefined {
-  // Normalize to lower case
-  language = language.trim().toLowerCase();
-
-  // See if it's an exact match
-  if (language in KnownLanguage) {
-    return language as KnownLanguage;
-  }
-
-  // Check language aliases
-  if (language in LANGUAGE_ALIASES) {
-    return LANGUAGE_ALIASES[language];
-  }
-
-  return undefined;
-}
-
 function isPAT(value: string) {
   return artifactScanner.isAuthToken(value, [
     artifactScanner.GITHUB_PAT_CLASSIC_PATTERN,
@@ -237,19 +181,19 @@ function isPAT(value: string) {
   ]);
 }
 
-type RegistryMapping = Partial<Record<KnownLanguage, string[]>>;
+/**
+ * A list of always-enabled registry types. The registry types in this list are always
+ * enabled, because generic CodeQL workflow components may use them rather than just
+ * language-specific components.
+ */
+export const ALWAYS_ENABLED_REGISTRY_TYPE = [
+  "git_source",
+  "docker_registry",
+] as const;
 
-const LANGUAGE_TO_REGISTRY_TYPE: RegistryMapping = {
-  java: ["maven_repository"],
-  csharp: ["nuget_feed"],
-  javascript: ["npm_registry"],
-  python: ["python_index"],
-  ruby: ["rubygems_server"],
-  rust: ["cargo_registry"],
-  go: ["goproxy_server", "git_source"],
-} as const;
+type RegistryMapping = Partial<Record<BuiltInLanguage, string[]>>;
 
-const NEW_LANGUAGE_TO_REGISTRY_TYPE: Required<RegistryMapping> = {
+export const LANGUAGE_TO_REGISTRY_TYPE: Required<RegistryMapping> = {
   actions: [],
   cpp: [],
   java: ["maven_repository"],
@@ -293,90 +237,19 @@ function getRegistryAddress(
   }
 }
 
-/** Extracts an `AuthConfig` value from `config`. */
-export function getAuthConfig(
-  config: json.UnvalidatedObject<AuthConfig>,
-): AuthConfig {
-  // Start by checking for the OIDC configurations, since they have required properties
-  // which we can use to identify them.
-  if (isAzureConfig(config)) {
-    return {
-      tenant_id: config.tenant_id,
-      client_id: config.client_id,
-    } satisfies AzureConfig;
-  } else if (isAWSConfig(config)) {
-    return {
-      aws_region: config.aws_region,
-      account_id: config.account_id,
-      role_name: config.role_name,
-      domain: config.domain,
-      domain_owner: config.domain_owner,
-      audience: config.audience,
-    } satisfies AWSConfig;
-  } else if (isJFrogConfig(config)) {
-    return {
-      jfrog_oidc_provider_name: config.jfrog_oidc_provider_name,
-      identity_mapping_name: config.identity_mapping_name,
-      audience: config.audience,
-    } satisfies JFrogConfig;
-  } else if (isToken(config)) {
-    // There are three scenarios for non-OIDC authentication based on the registry type:
-    //
-    // 1. `username`+`token`
-    // 2. A `token` that combines the username and actual token, separated by ':'.
-    // 3. `username`+`password`
-    //
-    // In all three cases, all fields are optional. If the `token` field is present,
-    // we accept the configuration as a `Token` typed configuration, with the `token`
-    // value and an optional `username`. Otherwise, we accept the configuration
-    // typed as `UsernamePassword` (in the `else` clause below) with optional
-    // username and password. I.e. a private registry type that uses 1. or 2.,
-    // but has no `token` configured, will get accepted as `UsernamePassword` here.
-
-    if (isDefined(config.token)) {
-      // Mask token to reduce chance of accidental leakage in logs, if we have one.
-      core.setSecret(config.token);
-    }
-
-    return { username: config.username, token: config.token } satisfies Token;
-  } else {
-    let username: string | undefined = undefined;
-    let password: string | undefined = undefined;
-
-    // Both "username" and "password" are optional. If we have reached this point, we need
-    // to validate which of them are present and that they have the correct type if so.
-    if ("password" in config && json.isString(config.password)) {
-      // Mask password to reduce chance of accidental leakage in logs, if we have one.
-      core.setSecret(config.password);
-      password = config.password;
-    }
-    if ("username" in config && json.isString(config.username)) {
-      username = config.username;
-    }
-
-    // Return the `UsernamePassword` object. Both username and password may be undefined.
-    return {
-      username,
-      password,
-    } satisfies UsernamePassword;
-  }
-}
-
-// getCredentials returns registry credentials from action inputs.
-// It prefers `registries_credentials` over `registry_secrets`.
-// If neither is set, it returns an empty array.
+/**
+ * Returns registry credentials from action inputs.
+ * It prefers `registriesCredentials` over `registrySecrets`.
+ * If neither is set, it returns an empty array.
+ */
 export function getCredentials(
   logger: Logger,
   registrySecrets: string | undefined,
   registriesCredentials: string | undefined,
-  language: KnownLanguage | undefined,
-  skipUnusedRegistries: boolean = false,
+  language: BuiltInLanguage | undefined,
 ): Credential[] {
-  const registryMapping = skipUnusedRegistries
-    ? NEW_LANGUAGE_TO_REGISTRY_TYPE
-    : LANGUAGE_TO_REGISTRY_TYPE;
   const registryTypeForLanguage = language
-    ? registryMapping[language]
+    ? LANGUAGE_TO_REGISTRY_TYPE[language]
     : undefined;
 
   let credentialsStr: string;
@@ -424,8 +297,11 @@ export function getCredentials(
     const address = getRegistryAddress(e);
 
     // Filter credentials based on language if specified. `type` is the registry type.
-    // E.g., "maven_feed" for Java/Kotlin, "nuget_repository" for C#.
+    // E.g., "maven_repository" for Java/Kotlin, "nuget_feed" for C#.
+    // We always allow types in `ALWAYS_ENABLED_REGISTRY_TYPE` since they can be used by
+    // other parts of the workflow.
     if (
+      !ALWAYS_ENABLED_REGISTRY_TYPE.some((t) => t === e.type) &&
       registryTypeForLanguage &&
       !registryTypeForLanguage.some((t) => t === e.type)
     ) {
@@ -447,15 +323,18 @@ export function getCredentials(
     }
 
     // If the password or token looks like a GitHub PAT, warn if no username is configured.
-    if (
-      ((!hasUsername(authConfig) || !isDefined(authConfig.username)) &&
-        isUsernamePassword(authConfig) &&
-        isDefined(authConfig.password) &&
-        isPAT(authConfig.password)) ||
-      (isToken(authConfig) &&
-        isDefined(authConfig.token) &&
-        isPAT(authConfig.token))
-    ) {
+    const noUsername =
+      !hasUsername(authConfig) || !isDefined(authConfig.username);
+    const passwordIsPAT =
+      hasUsernameAndPassword(authConfig) &&
+      isDefined(authConfig.password) &&
+      isPAT(authConfig.password);
+    const tokenIsPAT =
+      hasToken(authConfig) &&
+      isDefined(authConfig.token) &&
+      isPAT(authConfig.token);
+
+    if (noUsername && (passwordIsPAT || tokenIsPAT)) {
       logger.warning(
         `A ${e.type} private registry is configured for ${e.host || e.url} using a GitHub Personal Access Token (PAT), but no username was provided. ` +
           `This may not work correctly. When configuring a private registry using a PAT, select "Username and password" and enter the username of the user ` +
@@ -463,8 +342,25 @@ export function getCredentials(
       );
     }
 
+    // Construct the base credential object.
+    const baseCredential: Omit<Registry, keyof Address> = { type: e.type };
+
+    // If "replaces-base" is present, it must be a boolean.
+    if ("replaces-base" in e) {
+      if (
+        isDefined(e["replaces-base"]) &&
+        typeof e["replaces-base"] === "boolean"
+      ) {
+        baseCredential["replaces-base"] = e["replaces-base"];
+      } else {
+        throw new ConfigurationError(
+          "Invalid credentials - 'replaces-base' must be a boolean",
+        );
+      }
+    }
+
     out.push({
-      type: e.type,
+      ...baseCredential,
       ...authConfig,
       ...address,
     });
@@ -514,7 +410,7 @@ async function getCliVersionFromFeatures(
   features: FeatureEnablement,
 ): Promise<CodeQLDefaultVersionInfo> {
   const gitHubVersion = await getGitHubVersion();
-  return await features.getDefaultCliVersion(gitHubVersion.type);
+  return await features.getEnabledDefaultCliVersions(gitHubVersion.type);
 }
 
 /**
@@ -539,7 +435,7 @@ export async function getDownloadUrl(
     // Retrieve information about the CLI version we should use. This will be either the linked
     // version, or the one enabled by FFs.
     const versionInfo = useFeaturesToDetermineCLI
-      ? await getCliVersionFromFeatures(features)
+      ? (await getCliVersionFromFeatures(features)).enabledVersions[0]
       : {
           cliVersion: defaults.cliVersion,
           tagName: defaults.bundleVersion,

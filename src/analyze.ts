@@ -5,11 +5,7 @@ import { performance } from "perf_hooks";
 import * as io from "@actions/io";
 import * as yaml from "js-yaml";
 
-import {
-  getTemporaryDirectory,
-  getRequiredInput,
-  PullRequestBranches,
-} from "./actions-util";
+import { getTemporaryDirectory, getRequiredInput } from "./actions-util";
 import * as analyses from "./analyses";
 import { setupCppAutobuild } from "./autobuild";
 import { type CodeQL } from "./codeql";
@@ -21,14 +17,13 @@ import {
 import { addDiagnostic, makeDiagnostic } from "./diagnostics";
 import {
   DiffThunkRange,
-  writeDiffRangesJsonFile,
-  getPullRequestEditedDiffRanges,
+  readDiffRangesJsonFile,
 } from "./diff-informed-analysis-utils";
 import { EnvVar } from "./environment";
 import { FeatureEnablement, Feature } from "./feature-flags";
-import { KnownLanguage, Language } from "./languages";
+import { BuiltInLanguage, Language } from "./languages";
 import { Logger, withGroupAsync } from "./logging";
-import { OverlayDatabaseMode } from "./overlay";
+import { OverlayDatabaseMode } from "./overlay/overlay-database-mode";
 import type * as sarif from "./sarif";
 import { DatabaseCreationTimings, EventReport } from "./status-report";
 import { endTracingForCluster } from "./tracer-config";
@@ -46,7 +41,7 @@ export class CodeQLAnalysisError extends Error {
   }
 }
 
-type KnownLanguageKey = keyof typeof KnownLanguage;
+type BuiltInLanguageKey = keyof typeof BuiltInLanguage;
 
 type RunQueriesDurationStatusReport = {
   /**
@@ -55,12 +50,12 @@ type RunQueriesDurationStatusReport = {
    * The "builtin" designation is now outdated with the move to CLI config parsing: this is the time
    * taken to run _all_ the queries.
    */
-  [L in KnownLanguageKey as `analyze_builtin_queries_${L}_duration_ms`]?: number;
+  [L in BuiltInLanguageKey as `analyze_builtin_queries_${L}_duration_ms`]?: number;
 };
 
 type InterpretResultsDurationStatusReport = {
   /** Time taken in ms to interpret results for the language (or undefined if this language was not analyzed). */
-  [L in KnownLanguageKey as `interpret_results_${L}_duration_ms`]?: number;
+  [L in BuiltInLanguageKey as `interpret_results_${L}_duration_ms`]?: number;
 };
 
 export interface QueriesStatusReport
@@ -120,12 +115,12 @@ export async function runExtraction(
 
     if (await shouldExtractLanguage(codeql, config, language)) {
       logger.startGroup(`Extracting ${language}`);
-      if (language === KnownLanguage.python) {
+      if (language === BuiltInLanguage.python) {
         await setupPythonExtractor(logger);
       }
       if (config.buildMode) {
         if (
-          language === KnownLanguage.cpp &&
+          language === BuiltInLanguage.cpp &&
           config.buildMode === BuildMode.Autobuild
         ) {
           await setupCppAutobuild(codeql, logger);
@@ -136,14 +131,14 @@ export async function runExtraction(
         // a stable path that caches can be restored into and that we can cache at the
         // end of the workflow (i.e. that does not get removed when the scratch directory is).
         if (
-          language === KnownLanguage.java &&
+          language === BuiltInLanguage.java &&
           config.buildMode === BuildMode.None
         ) {
           process.env["CODEQL_EXTRACTOR_JAVA_OPTION_BUILDLESS_DEPENDENCY_DIR"] =
             getJavaTempDependencyDir();
         }
         if (
-          language === KnownLanguage.csharp &&
+          language === BuiltInLanguage.csharp &&
           config.buildMode === BuildMode.None &&
           (await features.getValue(Feature.CsharpCacheBuildModeNone))
         ) {
@@ -237,32 +232,28 @@ async function finalizeDatabaseCreation(
  * the diff range information, or `undefined` if the feature is disabled.
  */
 export async function setupDiffInformedQueryRun(
-  branches: PullRequestBranches,
   logger: Logger,
 ): Promise<string | undefined> {
   return await withGroupAsync(
     "Generating diff range extension pack",
     async () => {
-      logger.info(
-        `Calculating diff ranges for ${branches.base}...${branches.head}`,
-      );
-      const diffRanges = await getPullRequestEditedDiffRanges(branches, logger);
+      const diffRanges = readDiffRangesJsonFile(logger);
+      if (diffRanges === undefined) {
+        logger.info(
+          "No precomputed diff ranges found; skipping diff-informed analysis stage.",
+        );
+        return undefined;
+      }
+
       const checkoutPath = getRequiredInput("checkout_path");
       const packDir = writeDiffRangeDataExtensionPack(
         logger,
         diffRanges,
         checkoutPath,
       );
-      if (packDir === undefined) {
-        logger.warning(
-          "Cannot create diff range extension pack for diff-informed queries; " +
-            "reverting to performing full analysis.",
-        );
-      } else {
-        logger.info(
-          `Successfully created diff range extension pack at ${packDir}.`,
-        );
-      }
+      logger.info(
+        `Successfully created diff range extension pack at ${packDir}.`,
+      );
       return packDir;
     },
   );
@@ -290,11 +281,11 @@ extensions:
         .join(checkoutPath, range.path)
         .replaceAll(path.sep, "/");
 
-      // Using yaml.dump() with `forceQuotes: true` ensures that all special
+      // Using yaml.dump() with `quoteStyle: "double"` ensures that all special
       // characters are escaped, and that the path is always rendered as a
       // quoted string on a single line.
       return (
-        `      - [${yaml.dump(filename, { forceQuotes: true }).trim()}, ` +
+        `      - [${yaml.dump(filename, { forceQuotes: true, quoteStyle: "single" }).trim()}, ` +
         `${range.startLine}, ${range.endLine}]\n`
       );
     })
@@ -316,18 +307,13 @@ extensions:
  * @param ranges The file line ranges, as returned by
  * `getPullRequestEditedDiffRanges`.
  * @param checkoutPath The path at which the repository was checked out.
- * @returns The absolute path of the directory containing the extension pack, or
- * `undefined` if no extension pack was created.
+ * @returns The absolute path of the directory containing the extension pack.
  */
 function writeDiffRangeDataExtensionPack(
   logger: Logger,
-  ranges: DiffThunkRange[] | undefined,
+  ranges: DiffThunkRange[],
   checkoutPath: string,
-): string | undefined {
-  if (ranges === undefined) {
-    return undefined;
-  }
-
+): string {
   if (ranges.length === 0) {
     // An empty diff range means that there are no added or modified lines in
     // the pull request. But the `restrictAlertsTo` extensible predicate
@@ -367,10 +353,6 @@ dataExtensions:
   logger.debug(
     `Wrote pr-diff-range extension pack to ${extensionFilePath}:\n${extensionContents}`,
   );
-
-  // Write the diff ranges to a JSON file, for action-side alert filtering by the
-  // upload-lib module.
-  writeDiffRangesJsonFile(logger, ranges);
 
   return diffRangeDir;
 }
@@ -704,7 +686,7 @@ export async function warnIfGoInstalledAfterInit(
 
       addDiagnostic(
         config,
-        KnownLanguage.go,
+        BuiltInLanguage.go,
         makeDiagnostic(
           "go/workflow/go-installed-after-codeql-init",
           "Go was installed after the `codeql-action/init` Action was run",

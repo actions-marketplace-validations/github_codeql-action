@@ -24,7 +24,7 @@ defaults:
 
 jobs:
   merge-back:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-latest
     environment: Automation
     if: github.repository == 'github/codeql-action'
     env:
@@ -44,13 +44,16 @@ jobs:
           GITHUB_CONTEXT: '${{ toJson(github) }}'
         run: echo "${GITHUB_CONTEXT}"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # ensure we have all tags and can push commits
-      - uses: actions/setup-node@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          python-version: '3.12'
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install JavaScript dependencies
+        run: npm ci
 
       - name: Update git config
         run: |
@@ -124,14 +127,14 @@ jobs:
         env:
           PARTIAL_CHANGELOG: "${{ runner.temp }}/partial_changelog.md"
         run: |
-          python .github/workflows/script/prepare_changelog.py CHANGELOG.md > $PARTIAL_CHANGELOG
+          npx tsx pr-checks/prepare-changelog.ts --output="$PARTIAL_CHANGELOG"
 
           echo "::group::Partial CHANGELOG"
           cat $PARTIAL_CHANGELOG
           echo "::endgroup::"
 
       - name: Generate token
-        uses: actions/create-github-app-token@v3.0.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
           app-id: ${{ vars.AUTOMATION_APP_ID }}

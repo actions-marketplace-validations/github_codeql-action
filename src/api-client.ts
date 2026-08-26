@@ -1,9 +1,26 @@
 import * as core from "@actions/core";
 import * as githubUtils from "@actions/github/lib/utils";
+import { type Octokit } from "@octokit/core";
+import { type PaginateInterface } from "@octokit/plugin-paginate-rest";
+import { type Api } from "@octokit/plugin-rest-endpoint-methods";
 import * as retry from "@octokit/plugin-retry";
+import { RequestRequestOptions } from "@octokit/types";
+import {
+  ProxyAgent,
+  RequestInfo,
+  RequestInit,
+  fetch as undiciFetch,
+} from "undici";
 
+import type { ActionState } from "./action-common";
 import { getActionVersion, getRequiredInput } from "./actions-util";
-import { EnvVar } from "./environment";
+import {
+  ActionsEnvVars,
+  EnvVar,
+  ReadOnlyEnv,
+  RegistryProxyVars,
+  getEnv,
+} from "./environment";
 import { Logger } from "./logging";
 import { getRepositoryNwo, RepositoryNwo } from "./repository";
 import {
@@ -43,13 +60,90 @@ export interface GitHubApiExternalRepoDetails {
   apiURL: string | undefined;
 }
 
+/**
+ * Gets the configuration for the private registry authentication proxy,
+ * if it is available in the environment.
+ *
+ * @param action The required Action state.
+ * @returns The hostname, port, and CA retrieved from the corresponding environment variables.
+ */
+export function getRegistryProxyConfig(action: ActionState<["ReadOnlyEnv"]>) {
+  return {
+    host: action.env.getOptional(RegistryProxyVars.PROXY_HOST),
+    port: action.env.getOptional(RegistryProxyVars.PROXY_PORT),
+    ca: action.env.getOptional(RegistryProxyVars.PROXY_CA_CERTIFICATE),
+  };
+}
+
+/**
+ * Gets the configuration for the private registry authentication proxy,
+ * and uses it to initialise a corresponding `ProxyAgent`.
+ *
+ * @param action The required Action state.
+ * @returns A `ProxyAgent` corresponding to the private registry proxy,
+ *          or `undefined` if we couldn't retrieve the host and port.
+ */
+export function getRegistryProxy(
+  action: ActionState<["Logger", "ReadOnlyEnv"]>,
+): ProxyAgent | undefined {
+  const { host, port, ca } = getRegistryProxyConfig(action);
+
+  if (host && port) {
+    const uri = `http://${host}:${port}`;
+    action.logger.debug(
+      `Using private registry proxy at '${uri}' for API client.`,
+    );
+    return new ProxyAgent({
+      uri,
+      keepAliveTimeout: 10,
+      keepAliveMaxTimeout: 10,
+      requestTls: ca ? { ca } : undefined,
+    });
+  }
+
+  return undefined;
+}
+
+/**
+ * Constructs a `RequestRequestOptions` with a custom `fetch` implementation
+ * that uses `dispatcher` as a proxy for requests.
+ *
+ * @param dispatcher The proxy to use, if any.
+ */
+export function makeProxyRequestOptions(
+  dispatcher: ProxyAgent | undefined,
+): RequestRequestOptions | undefined {
+  // If we don't have a custom `ProxyAgent`, return the defaults.
+  if (dispatcher === undefined) {
+    return githubUtils.defaults.request;
+  }
+
+  // Otherwise, construct the custom `fetch` and add it onto the defaults.
+  return {
+    ...githubUtils.defaults.request,
+    fetch: (req: RequestInfo, init?: RequestInit) => {
+      return undiciFetch(req, { ...init, dispatcher });
+    },
+  };
+}
+
+/** The type of GitHub API client we use. */
+export type ApiClient = Octokit & Api & { paginate: PaginateInterface };
+
+/** Options for `createApiClientWithDetails`. */
+interface CreateApiClientOptions {
+  allowExternal?: boolean;
+  proxy?: ProxyAgent;
+}
+
 function createApiClientWithDetails(
   apiDetails: GitHubApiCombinedDetails,
-  { allowExternal = false } = {},
-) {
+  { allowExternal = false, proxy = undefined }: CreateApiClientOptions = {},
+): ApiClient {
   const auth =
     (allowExternal && apiDetails.externalRepoAuth) || apiDetails.auth;
   const retryingOctokit = githubUtils.GitHub.plugin(retry.retry);
+  const requestOptions = makeProxyRequestOptions(proxy);
   return new retryingOctokit(
     githubUtils.getOctokitOptions(auth, {
       baseUrl: apiDetails.apiURL,
@@ -60,6 +154,7 @@ function createApiClientWithDetails(
         warn: core.warning,
         error: core.error,
       },
+      request: requestOptions,
       retry: {
         doNotRetry: DO_NOT_RETRY_STATUSES,
       },
@@ -67,22 +162,23 @@ function createApiClientWithDetails(
   );
 }
 
-export function getApiDetails(): GitHubApiDetails {
+export function getApiDetails(env: ReadOnlyEnv = getEnv()): GitHubApiDetails {
   return {
     auth: getRequiredInput("token"),
-    url: getRequiredEnvParam("GITHUB_SERVER_URL"),
-    apiURL: getRequiredEnvParam("GITHUB_API_URL"),
+    url: env.getRequired(ActionsEnvVars.GITHUB_SERVER_URL),
+    apiURL: env.getRequired(ActionsEnvVars.GITHUB_API_URL),
   };
 }
 
-export function getApiClient() {
-  return createApiClientWithDetails(getApiDetails());
+export function getApiClient(env: ReadOnlyEnv = getEnv()) {
+  return createApiClientWithDetails(getApiDetails(env));
 }
 
 export function getApiClientWithExternalAuth(
   apiDetails: GitHubApiCombinedDetails,
+  proxy?: ProxyAgent,
 ) {
-  return createApiClientWithDetails(apiDetails, { allowExternal: true });
+  return createApiClientWithDetails(apiDetails, { allowExternal: true, proxy });
 }
 
 /**
@@ -128,6 +224,8 @@ export async function getGitHubVersionFromApi(
 
   // Doesn't strictly have to be the meta endpoint as we're only
   // using the response headers which are available on every request.
+  //
+  // See https://docs.github.com/en/rest/meta/meta#get-github-meta-information.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-call
   const response = await apiClient.rest.meta.get();
 
@@ -164,6 +262,9 @@ export async function getGitHubVersion(): Promise<GitHubVersion> {
 
 /**
  * Get the path of the currently executing workflow relative to the repository root.
+ *
+ * See https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run
+ * and https://docs.github.com/en/rest/actions/workflows#get-a-workflow.
  */
 export async function getWorkflowRelativePath(): Promise<string> {
   const repo_nwo = getRepositoryNwo();
@@ -252,9 +353,13 @@ export interface ActionsCacheItem {
   size_in_bytes?: number;
 }
 
-/** List all Actions cache entries matching the provided key and ref. */
+/**
+ * List all Actions cache entries starting with the provided key prefix and matching the provided ref.
+ *
+ * See https://docs.github.com/en/rest/actions/cache#list-github-actions-caches-for-a-repository.
+ */
 export async function listActionsCaches(
-  key: string,
+  keyPrefix: string,
   ref?: string,
 ): Promise<ActionsCacheItem[]> {
   const repositoryNwo = getRepositoryNwo();
@@ -264,13 +369,17 @@ export async function listActionsCaches(
     {
       owner: repositoryNwo.owner,
       repo: repositoryNwo.repo,
-      key,
+      key: keyPrefix,
       ref,
     },
   );
 }
 
-/** Delete an Actions cache item by its ID. */
+/**
+ * Delete an Actions cache item by its ID.
+ *
+ * See https://docs.github.com/en/rest/actions/cache#delete-a-github-actions-cache-for-a-repository-using-a-cache-id.
+ */
 export async function deleteActionsCache(id: number) {
   const repositoryNwo = getRepositoryNwo();
 
@@ -281,7 +390,11 @@ export async function deleteActionsCache(id: number) {
   });
 }
 
-/** Retrieve all custom repository properties. */
+/**
+ * Retrieve all custom repository properties.
+ *
+ * See https://docs.github.com/en/rest/repos/custom-properties#get-all-custom-property-values-for-a-repository.
+ */
 export async function getRepositoryProperties(repositoryNwo: RepositoryNwo) {
   return getApiClient().request("GET /repos/:owner/:repo/properties/values", {
     owner: repositoryNwo.owner,
@@ -294,6 +407,7 @@ function isEnablementError(msg: string) {
     /Code Security must be enabled/i,
     /Advanced Security must be enabled/i,
     /Code Scanning is not enabled/i,
+    /Code Quality is not enabled/i,
   ].some((pattern) => pattern.test(msg));
 }
 

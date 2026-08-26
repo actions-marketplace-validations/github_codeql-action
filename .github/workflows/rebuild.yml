@@ -24,13 +24,13 @@ jobs:
       pull-requests: write # needed to comment on the PR
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ env.HEAD_REF }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: 'npm'
@@ -143,6 +143,5 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           echo "Pushed a commit to rebuild the Action." \
-            "Please mark the PR as ready for review to trigger PR checks." |
+            "Please approve running the PR checks." |
             gh pr comment --body-file - --repo github/codeql-action "$PR_NUMBER"
-          gh pr ready --undo --repo github/codeql-action "$PR_NUMBER"

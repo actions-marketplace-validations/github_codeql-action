@@ -7,17 +7,27 @@ import { default as deepEqual } from "fast-deep-equal";
 import * as semver from "semver";
 import { v4 as uuidV4 } from "uuid";
 
-import { isDynamicWorkflow, isRunningLocalAction } from "./actions-util";
+import {
+  isAnalyzingPullRequest,
+  isDynamicWorkflow,
+  isRunningLocalAction,
+} from "./actions-util";
 import * as api from "./api-client";
 import * as defaults from "./defaults.json";
-import { addNoLanguageDiagnostic, makeDiagnostic } from "./diagnostics";
+import {
+  addNoLanguageDiagnostic,
+  makeDiagnostic,
+  makeTelemetryDiagnostic,
+} from "./diagnostics";
 import {
   CODEQL_VERSION_ZSTD_BUNDLE,
   CodeQLDefaultVersionInfo,
+  CodeQLVersionInfo,
   Feature,
   FeatureEnablement,
 } from "./feature-flags";
 import { Logger } from "./logging";
+import { getCodeQlVersionsForOverlayBaseDatabases } from "./overlay/caching";
 import * as tar from "./tar";
 import {
   downloadAndExtract,
@@ -265,11 +275,130 @@ async function findOverridingToolsInCache(
 }
 
 /**
+ * Returns the sorted set of enabled versions that have cached overlay-base databases for the
+ * given languages, or an empty list if neither the `OverlayAnalysisMatchCodeqlVersion` nor the
+ * `OverlayAnalysisMatchCodeqlVersionDryRun` feature flag is enabled. When only the dry-run flag
+ * is enabled, this performs the lookup and emits a telemetry diagnostic with the version that
+ * would have been chosen, but still returns an empty list so the caller falls back.
+ */
+export async function getEnabledVersionsWithOverlayBaseDatabases(
+  defaultCliVersion: CodeQLDefaultVersionInfo,
+  rawLanguages: string[] | undefined,
+  features: FeatureEnablement,
+  logger: Logger,
+): Promise<CodeQLVersionInfo[]> {
+  if (rawLanguages === undefined || rawLanguages.length === 0) {
+    return [];
+  }
+  const isEnabled = await features.getValue(
+    Feature.OverlayAnalysisMatchCodeqlVersion,
+  );
+  const isDryRun =
+    !isEnabled &&
+    (await features.getValue(Feature.OverlayAnalysisMatchCodeqlVersionDryRun));
+  if (!isEnabled && !isDryRun) {
+    return [];
+  }
+
+  let cachedVersions: string[] | undefined;
+  try {
+    cachedVersions = await getCodeQlVersionsForOverlayBaseDatabases(
+      rawLanguages,
+      logger,
+    );
+  } catch (e) {
+    logger.warning(
+      "Could not list overlay-base databases in the Actions cache while choosing a default " +
+        `CodeQL CLI version, falling back to the highest enabled version. Details: ${util.getErrorMessage(e)}`,
+    );
+    return [];
+  }
+
+  if (cachedVersions === undefined || cachedVersions.length === 0) {
+    return [];
+  }
+
+  const cachedVersionsSet = new Set(cachedVersions);
+  const overlayVersions = defaultCliVersion.enabledVersions.filter((v) =>
+    cachedVersionsSet.has(v.cliVersion),
+  );
+
+  if (overlayVersions.length === 0) {
+    return [];
+  }
+
+  const isCachedVersionDifferent =
+    overlayVersions[0].cliVersion !==
+    defaultCliVersion.enabledVersions[0].cliVersion;
+
+  if (isCachedVersionDifferent) {
+    addNoLanguageDiagnostic(
+      undefined,
+      makeTelemetryDiagnostic(
+        "codeql-action/overlay-aware-default-codeql-version",
+        "Overlay-aware default CodeQL version selection",
+        {
+          cachedVersions,
+          enabledVersions: defaultCliVersion.enabledVersions.map(
+            (v) => v.cliVersion,
+          ),
+          isDryRun,
+          overlayAwareVersion: overlayVersions[0].cliVersion,
+        },
+      ),
+    );
+  }
+
+  if (isDryRun) {
+    logger.debug(
+      `Overlay-aware default CodeQL version selection is running in dry-run mode. Would have used version ${overlayVersions[0].cliVersion}.`,
+    );
+    return [];
+  }
+
+  return overlayVersions;
+}
+
+/**
+ * Resolves the newest enabled default CLI version that has a cached overlay-base database for the
+ * relevant languages, if running a Code Scanning analysis for a pull request and one exists.
+ * Otherwise, falls back to the newest enabled default CLI version.
+ */
+async function resolveDefaultCliVersion(
+  defaultCliVersion: CodeQLDefaultVersionInfo,
+  rawLanguages: string[] | undefined,
+  useOverlayAwareDefaultCliVersion: boolean,
+  features: FeatureEnablement,
+  logger: Logger,
+): Promise<CodeQLVersionInfo> {
+  if (!useOverlayAwareDefaultCliVersion || !isAnalyzingPullRequest()) {
+    return defaultCliVersion.enabledVersions[0];
+  }
+
+  const overlayVersions = await getEnabledVersionsWithOverlayBaseDatabases(
+    defaultCliVersion,
+    rawLanguages,
+    features,
+    logger,
+  );
+  if (overlayVersions.length > 0) {
+    logger.info(
+      `Using CodeQL version ${overlayVersions[0].cliVersion} since this is the ` +
+        `highest enabled version that has a cached overlay-base database.`,
+    );
+    return overlayVersions[0];
+  }
+  return defaultCliVersion.enabledVersions[0];
+}
+
+/**
  * Determines where the CodeQL CLI we want to use comes from. This can be from a local file,
  * the Actions toolcache, or a download.
  *
  * @param toolsInput The argument provided for the `tools` input, if any.
  * @param defaultCliVersion The default CLI version that's linked to the CodeQL Action.
+ * @param rawLanguages Raw set of languages.
+ * @param useOverlayAwareDefaultCliVersion Whether to select an overlay-aware default CLI version.
  * @param apiDetails Information about the GitHub API.
  * @param variant The GitHub variant we are running on.
  * @param tarSupportsZstd Whether zstd is supported by `tar`.
@@ -281,6 +410,8 @@ async function findOverridingToolsInCache(
 export async function getCodeQLSource(
   toolsInput: string | undefined,
   defaultCliVersion: CodeQLDefaultVersionInfo,
+  rawLanguages: string[] | undefined,
+  useOverlayAwareDefaultCliVersion: boolean,
   apiDetails: api.GitHubApiDetails,
   variant: util.GitHubVariant,
   tarSupportsZstd: boolean,
@@ -402,11 +533,7 @@ export async function getCodeQLSource(
     // We only allow `toolsInput === "toolcache"` for `dynamic` events. In general, using `toolsInput === "toolcache"`
     // can lead to alert wobble and so it shouldn't be used for an analysis where results are intended to be uploaded.
     // We also allow this in test mode.
-    const allowToolcacheValueFF = await features.getValue(
-      Feature.AllowToolcacheInput,
-    );
-    const allowToolcacheValue =
-      allowToolcacheValueFF && (isDynamicWorkflow() || util.isInTestMode());
+    const allowToolcacheValue = isDynamicWorkflow() || util.isInTestMode();
     if (allowToolcacheValue) {
       // If `toolsInput === "toolcache"`, try to find the latest version of the CLI that's available in the toolcache
       // and use that. We perform this check here since we can set `cliVersion` directly and don't want to default to
@@ -427,19 +554,20 @@ export async function getCodeQLSource(
           `Found no CodeQL CLI in the toolcache, ignoring 'tools: ${toolsInput}'...`,
         );
       } else {
-        if (allowToolcacheValueFF) {
-          logger.warning(
-            `Ignoring 'tools: ${toolsInput}' because the workflow was not triggered dynamically.`,
-          );
-        } else {
-          logger.info(
-            `Ignoring 'tools: ${toolsInput}' because the feature is not enabled.`,
-          );
-        }
+        logger.warning(
+          `Ignoring 'tools: ${toolsInput}' because the workflow was not triggered dynamically.`,
+        );
       }
 
-      cliVersion = defaultCliVersion.cliVersion;
-      tagName = defaultCliVersion.tagName;
+      const version = await resolveDefaultCliVersion(
+        defaultCliVersion,
+        rawLanguages,
+        useOverlayAwareDefaultCliVersion,
+        features,
+        logger,
+      );
+      cliVersion = version.cliVersion;
+      tagName = version.tagName;
     }
   } else if (toolsInput !== undefined) {
     // If a tools URL was provided, then use that.
@@ -454,9 +582,15 @@ export async function getCodeQLSource(
       }
     }
   } else {
-    // Otherwise, use the default CLI version passed in.
-    cliVersion = defaultCliVersion.cliVersion;
-    tagName = defaultCliVersion.tagName;
+    const version = await resolveDefaultCliVersion(
+      defaultCliVersion,
+      rawLanguages,
+      useOverlayAwareDefaultCliVersion,
+      features,
+      logger,
+    );
+    cliVersion = version.cliVersion;
+    tagName = version.tagName;
   }
 
   const bundleVersion =
@@ -777,7 +911,6 @@ interface SetupCodeQLResult {
   toolsDownloadStatusReport?: ToolsDownloadStatusReport;
   toolsSource: ToolsSource;
   toolsVersion: string;
-  zstdAvailability: tar.ZstdAvailability;
 }
 
 /**
@@ -791,6 +924,8 @@ export async function setupCodeQLBundle(
   tempDir: string,
   variant: util.GitHubVariant,
   defaultCliVersion: CodeQLDefaultVersionInfo,
+  rawLanguages: string[] | undefined,
+  useOverlayAwareDefaultCliVersion: boolean,
   features: FeatureEnablement,
   logger: Logger,
 ): Promise<SetupCodeQLResult> {
@@ -804,6 +939,8 @@ export async function setupCodeQLBundle(
   const source = await getCodeQLSource(
     toolsInput,
     defaultCliVersion,
+    rawLanguages,
+    useOverlayAwareDefaultCliVersion,
     apiDetails,
     variant,
     zstdAvailability.available,
@@ -857,7 +994,6 @@ export async function setupCodeQLBundle(
     toolsDownloadStatusReport,
     toolsSource,
     toolsVersion,
-    zstdAvailability,
   };
 }
 

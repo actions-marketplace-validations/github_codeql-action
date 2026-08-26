@@ -3,18 +3,18 @@ import * as path from "path";
 
 import * as core from "@actions/core";
 
+import { Action, ActionState, runInActions } from "./action-common";
 import * as actionsUtil from "./actions-util";
 import { getGitHubVersion } from "./api-client";
-import { Feature, FeatureEnablement, initFeatures } from "./feature-flags";
-import { KnownLanguage } from "./languages";
-import { getActionsLogger, Logger } from "./logging";
+import { FeatureEnablement, initFeatures } from "./feature-flags";
+import { BuiltInLanguage, parseBuiltInLanguage } from "./languages";
+import { Logger } from "./logging";
 import { getRepositoryNwo } from "./repository";
 import {
   credentialToStr,
   getCredentials,
   getProxyBinaryPath,
   getSafeErrorMessage,
-  parseLanguage,
   ProxyInfo,
   sendFailedStatusReport,
   sendSuccessStatusReport,
@@ -24,16 +24,16 @@ import {
 import { generateCertificateAuthority } from "./start-proxy/ca";
 import { checkProxyEnvironment } from "./start-proxy/environment";
 import { checkConnections } from "./start-proxy/reachability";
-import { ActionName, sendUnhandledErrorStatusReport } from "./status-report";
+import { ActionName } from "./status-report";
 import * as util from "./util";
 
-async function run(startedAt: Date) {
+async function run(action: ActionState<["Base", "Logger", "Env", "Actions"]>) {
   // To capture errors appropriately, keep as much code within the try-catch as
   // possible, and only use safe functions outside.
-
-  const logger = getActionsLogger();
+  const startedAt = action.startedAt;
+  const logger = action.logger;
   let features: FeatureEnablement | undefined;
-  let language: KnownLanguage | undefined;
+  let language: BuiltInLanguage | undefined;
 
   try {
     // Make inputs accessible in the `post` step.
@@ -56,12 +56,7 @@ async function run(startedAt: Date) {
 
     // Get the language input.
     const languageInput = actionsUtil.getOptionalInput("language");
-    language = languageInput ? parseLanguage(languageInput) : undefined;
-
-    // Query the FF for whether we should use the reduced registry mapping.
-    const skipUnusedRegistries = await features.getValue(
-      Feature.StartProxyRemoveUnusedRegistries,
-    );
+    language = languageInput ? parseBuiltInLanguage(languageInput) : undefined;
 
     // Get the registry configurations from one of the inputs.
     const credentials = getCredentials(
@@ -69,7 +64,6 @@ async function run(startedAt: Date) {
       actionsUtil.getOptionalInput("registry_secrets"),
       actionsUtil.getOptionalInput("registries_credentials"),
       language,
-      skipUnusedRegistries,
     );
 
     if (credentials.length === 0) {
@@ -112,14 +106,14 @@ async function run(startedAt: Date) {
       logger,
     );
 
-    // Check that the private registries are reachable.
+    // Perform best-effort checks that the private registries are reachable.
     await checkConnections(logger, proxyInfo);
 
     // Report success if we have reached this point.
     await sendSuccessStatusReport(
       startedAt,
       {
-        languages: language && [language],
+        languages: language === undefined ? undefined : [language],
       },
       proxyConfig.all_credentials.map((c) => c.type),
       logger,
@@ -129,21 +123,15 @@ async function run(startedAt: Date) {
   }
 }
 
-async function runWrapper() {
-  const startedAt = new Date();
-  const logger = getActionsLogger();
+/** Defines the `start-proxy` Action. */
+const startProxyAction: Action = {
+  name: ActionName.StartProxy,
+  run,
+  transformTelemetryError: getSafeErrorMessage,
+};
 
-  try {
-    await run(startedAt);
-  } catch (error) {
-    core.setFailed(`start-proxy action failed: ${util.getErrorMessage(error)}`);
-    await sendUnhandledErrorStatusReport(
-      ActionName.StartProxy,
-      startedAt,
-      getSafeErrorMessage(util.wrapError(error)),
-      logger,
-    );
-  }
+export async function runWrapper() {
+  await runInActions(startProxyAction);
 }
 
 async function startProxy(
@@ -199,10 +187,9 @@ async function startProxy(
     .map((credential) => ({
       type: credential.type,
       url: credential.url,
+      "replaces-base": credential["replaces-base"],
     }));
   core.setOutput("proxy_urls", JSON.stringify(registry_urls));
 
   return { host, port, cert: config.ca.cert, registries: registry_urls };
 }
-
-void runWrapper();

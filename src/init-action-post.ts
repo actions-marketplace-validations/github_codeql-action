@@ -75,7 +75,7 @@ async function run(startedAt: Date) {
         "Debugging artifacts are unavailable since the 'init' Action failed before it could produce any.",
       );
     } else {
-      const codeql = await getCodeQL(config.codeQLCmd);
+      const codeql = await getCodeQL(logger, config.codeQLCmd);
 
       uploadFailedSarifResult = await initActionPostHelper.uploadFailureInfo(
         debugArtifacts.tryUploadAllAvailableDebugArtifacts,
@@ -207,7 +207,7 @@ function getJobStatusFromEnvironment(): JobStatus | undefined {
   return undefined;
 }
 
-async function runWrapper() {
+export async function runWrapper() {
   const startedAt = new Date();
   const logger = getActionsLogger();
   try {
@@ -222,5 +222,3 @@ async function runWrapper() {
     );
   }
 }
-
-void runWrapper();

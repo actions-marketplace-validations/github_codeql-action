@@ -12,12 +12,7 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+  pull_request: {}
   merge_group:
     types:
       - checks_requested
@@ -40,7 +35,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            version: stable-v2.19.3
+            version: stable-v2.19.4
           - os: ubuntu-latest
             version: stable-v2.22.1
           - os: ubuntu-latest
@@ -58,7 +53,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test

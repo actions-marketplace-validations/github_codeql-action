@@ -7,6 +7,7 @@ import * as github from "@actions/github";
 import * as io from "@actions/io";
 import * as yaml from "js-yaml";
 
+import { ActionState } from "./action-common";
 import {
   getOptionalInput,
   isAnalyzingPullRequest,
@@ -26,10 +27,9 @@ import {
   RepositoryProperties,
   RepositoryPropertyName,
 } from "./feature-flags/properties";
-import { KnownLanguage, Language } from "./languages";
+import { BuiltInLanguage, Language } from "./languages";
 import { Logger, withGroupAsync } from "./logging";
 import { ToolsSource } from "./setup-codeql";
-import { ZstdAvailability } from "./tar";
 import { ToolsDownloadStatusReport } from "./tools-download";
 import * as util from "./util";
 
@@ -39,6 +39,8 @@ export async function initCodeQL(
   tempDir: string,
   variant: util.GitHubVariant,
   defaultCliVersion: CodeQLDefaultVersionInfo,
+  rawLanguages: string[] | undefined,
+  useOverlayAwareDefaultCliVersion: boolean,
   features: FeatureEnablement,
   logger: Logger,
 ): Promise<{
@@ -46,25 +48,21 @@ export async function initCodeQL(
   toolsDownloadStatusReport?: ToolsDownloadStatusReport;
   toolsSource: ToolsSource;
   toolsVersion: string;
-  zstdAvailability: ZstdAvailability;
 }> {
   logger.startGroup("Setup CodeQL tools");
-  const {
-    codeql,
-    toolsDownloadStatusReport,
-    toolsSource,
-    toolsVersion,
-    zstdAvailability,
-  } = await setupCodeQL(
-    toolsInput,
-    apiDetails,
-    tempDir,
-    variant,
-    defaultCliVersion,
-    features,
-    logger,
-    true,
-  );
+  const { codeql, toolsDownloadStatusReport, toolsSource, toolsVersion } =
+    await setupCodeQL(
+      toolsInput,
+      apiDetails,
+      tempDir,
+      variant,
+      defaultCliVersion,
+      rawLanguages,
+      useOverlayAwareDefaultCliVersion,
+      features,
+      logger,
+      true,
+    );
   await codeql.printVersion();
   logger.endGroup();
   return {
@@ -72,16 +70,15 @@ export async function initCodeQL(
     toolsDownloadStatusReport,
     toolsSource,
     toolsVersion,
-    zstdAvailability,
   };
 }
 
 export async function initConfig(
-  features: FeatureEnablement,
+  actionState: ActionState<["Logger", "Env", "FeatureFlags"]>,
   inputs: configUtils.InitConfigInputs,
 ): Promise<configUtils.Config> {
   return await withGroupAsync("Load language configuration", async () => {
-    return await configUtils.initConfig(features, inputs);
+    return await configUtils.initConfig(actionState, inputs);
   });
 }
 
@@ -92,7 +89,6 @@ export async function runDatabaseInitCluster(
   sourceRoot: string,
   processName: string | undefined,
   qlconfigFile: string | undefined,
-  logger: Logger,
 ): Promise<void> {
   fs.mkdirSync(config.dbLocation, { recursive: true });
   await configUtils.wrapEnvironment(
@@ -103,7 +99,6 @@ export async function runDatabaseInitCluster(
         sourceRoot,
         processName,
         qlconfigFile,
-        logger,
       ),
   );
 }
@@ -235,7 +230,7 @@ export async function checkInstallPython311(
   codeql: CodeQL,
 ) {
   if (
-    languages.includes(KnownLanguage.python) &&
+    languages.includes(BuiltInLanguage.python) &&
     process.platform === "win32" &&
     !(await codeql.getVersion()).features?.supportsPython312
   ) {

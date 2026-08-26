@@ -4,9 +4,6 @@ on:
   push:
     branches: [main, releases/v*]
   pull_request:
-    # Run checks on reopened draft PRs to support triggering PR checks on draft PRs that were opened
-    # by other workflows.
-    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
   schedule:
@@ -35,7 +32,7 @@ jobs:
       security-events: read
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Set up default CodeQL bundle
       id: setup-default
       uses: ./setup-codeql
@@ -77,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04,ubuntu-24.04,windows-2022,windows-2025,macos-14,macos-15]
+        os: [ubuntu-22.04,ubuntu-24.04,windows-2022,windows-2025,macos-14-xlarge,macos-15-xlarge]
         tools: ${{ fromJson(needs.check-codeql-versions.outputs.versions) }}
     runs-on: ${{ matrix.os }}
 
@@ -87,7 +84,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Initialize CodeQL
       uses: ./init
       id: init
@@ -116,7 +113,6 @@ jobs:
       matrix:
         include:
           - language: actions
-          - language: python
 
     permissions:
       contents: read
@@ -124,7 +120,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Initialize CodeQL
       uses: ./init
       with:

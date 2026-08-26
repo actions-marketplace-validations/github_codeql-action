@@ -20,7 +20,7 @@ import { EnvVar } from "./environment";
 import { getActionsLogger } from "./logging";
 import { checkGitHubVersionInRange, getErrorMessage } from "./util";
 
-async function runWrapper() {
+export async function runWrapper() {
   // To capture errors appropriately, keep as much code within the try-catch as
   // possible, and only use safe functions outside.
 
@@ -38,7 +38,7 @@ async function runWrapper() {
         logger,
       );
       if (config !== undefined) {
-        const codeql = await getCodeQL(config.codeQLCmd);
+        const codeql = await getCodeQL(logger, config.codeQLCmd);
         const version = await codeql.getVersion();
         await debugArtifacts.uploadCombinedSarifArtifacts(
           logger,
@@ -72,5 +72,3 @@ async function runWrapper() {
     );
   }
 }
-
-void runWrapper();

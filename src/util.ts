@@ -10,13 +10,16 @@ import * as yaml from "js-yaml";
 import * as semver from "semver";
 
 import * as apiCompatibility from "./api-compatibility.json";
-import type { CodeQL, VersionInfo } from "./codeql";
+import type { CodeQL } from "./codeql";
 import type { Pack } from "./config/db-config";
 import type { Config } from "./config-utils";
-import { EnvVar } from "./environment";
+import { EnvVar, getRequiredEnvParam } from "./environment";
 import * as json from "./json";
 import { Language } from "./languages";
 import { Logger } from "./logging";
+
+// Re-export for backwards compatibility to avoid updating a lot of imports elsewhere.
+export { getRequiredEnvParam, getOptionalEnvVar, getEnv } from "./environment";
 
 /**
  * The name of the file containing the base database OIDs, as stored in the
@@ -566,28 +569,6 @@ export function initializeEnvironment(version: string) {
   core.exportVariable(EnvVar.VERSION, version);
 }
 
-/**
- * Get an environment parameter, but throw an error if it is not set.
- */
-export function getRequiredEnvParam(paramName: string): string {
-  const value = process.env[paramName];
-  if (value === undefined || value.length === 0) {
-    throw new Error(`${paramName} environment variable must be set`);
-  }
-  return value;
-}
-
-/**
- * Get an environment variable, but return `undefined` if it is not set or empty.
- */
-export function getOptionalEnvVar(paramName: string): string | undefined {
-  const value = process.env[paramName];
-  if (value?.trim().length === 0) {
-    return undefined;
-  }
-  return value;
-}
-
 export class HTTPError extends Error {
   public status: number;
 
@@ -617,19 +598,6 @@ export function asHTTPError(arg: any): HTTPError | undefined {
   return undefined;
 }
 
-let cachedCodeQlVersion: undefined | VersionInfo = undefined;
-
-export function cacheCodeQlVersion(version: VersionInfo): void {
-  if (cachedCodeQlVersion !== undefined) {
-    throw new Error("cacheCodeQlVersion() should be called only once");
-  }
-  cachedCodeQlVersion = version;
-}
-
-export function getCachedCodeQlVersion(): undefined | VersionInfo {
-  return cachedCodeQlVersion;
-}
-
 export async function codeQlVersionAtLeast(
   codeql: CodeQL,
   requiredVersion: string,
@@ -641,7 +609,13 @@ export function getBaseDatabaseOidsFilePath(config: Config): string {
   return path.join(config.dbLocation, BASE_DATABASE_OIDS_FILE_NAME);
 }
 
-// Create a bundle for the given DB, if it doesn't already exist
+/**
+ * Bundles the database for the given language into a `.zip` file, returning the path to it.
+ *
+ * If a bundle for `dbName` already exists (e.g. from an earlier call), it is deleted and
+ * re-created, so each call produces a fresh bundle reflecting the current database contents and the
+ * given `includeDiagnostics` value.
+ */
 export async function bundleDb(
   config: Config,
   language: Language,

@@ -5,7 +5,17 @@ import * as path from "path";
 
 import * as yaml from "yaml";
 
-import { KnownLanguage } from "../src/languages";
+import { BuiltInLanguage } from "../src/languages";
+
+/**
+ * Returns a `uses` value for `action` pinned to a commit SHA, with the
+ * human-readable version recorded in a trailing comment.
+ */
+function pinnedUses(action: string, sha: string, version: string): yaml.Scalar {
+  const node = new yaml.Scalar(`${action}@${sha}`);
+  node.comment = ` ${version}`;
+  return node;
+}
 
 /** Known workflow input names. */
 enum KnownInputName {
@@ -28,6 +38,31 @@ interface WorkflowInput {
 /** A partial mapping from known input names to input definitions. */
 type WorkflowInputs = Partial<Record<KnownInputName, WorkflowInput>>;
 
+/** An operating system identifier. */
+type OperatingSystemIdentifier = "ubuntu" | "macos" | "windows";
+
+/**
+ * Represents an operating system matrix entry for a generated PR check workflow.
+ *
+ * Either a string containing the OS identifier or an object containing the OS identifier and an
+ * optional runner image label.
+ */
+type OperatingSystem =
+  | OperatingSystemIdentifier
+  | {
+      /** OS identifier. */
+      os: OperatingSystemIdentifier;
+      /** Optional runner image label. */
+      "runner-image"?: string;
+      /**
+       * Optional CodeQL versions to run on this entry. If specified, this entry runs only these
+       * versions. A sibling entry for the same OS that omits `codeql-versions` runs all versions
+       * not claimed by any sibling entry. This allows pinning specific CodeQL versions to a
+       * particular runner image while letting the remaining versions default to another.
+       */
+      "codeql-versions"?: string[];
+    };
+
 /**
  * Represents PR check specifications.
  */
@@ -36,8 +71,8 @@ interface Specification extends JobSpecification {
   inputs?: Record<string, WorkflowInput>;
   /** CodeQL bundle versions to test against. Defaults to `DEFAULT_TEST_VERSIONS`. */
   versions?: string[];
-  /** Operating system prefixes used to select runner images (e.g. `["ubuntu", "macos"]`). */
-  operatingSystems?: string[];
+  /** Operating system prefixes, either as strings or with explicit runner image labels. */
+  operatingSystems?: OperatingSystem[];
   /** Per-OS version overrides. If specified for an OS, only those versions are tested on that OS. */
   osCodeQlVersions?: Record<string, string[]>;
   /** Whether to use the all-platform CodeQL bundle. */
@@ -91,16 +126,12 @@ interface LanguageSetup {
   steps: Step[];
 }
 
-/** Describes partial mappings from known languages to their specific setup information. */
-type LanguageSetups = Partial<Record<KnownLanguage, LanguageSetup>>;
+/** Describes partial mappings from built-in languages to their specific setup information. */
+type LanguageSetups = Partial<Record<BuiltInLanguage, LanguageSetup>>;
 
 // The default set of CodeQL Bundle versions to use for the PR checks.
 const defaultTestVersions = [
   // The oldest supported CodeQL version. If bumping, update `CODEQL_MINIMUM_VERSION` in `codeql.ts`
-  "stable-v2.17.6",
-  // The last CodeQL release in the 2.18 series.
-  "stable-v2.18.4",
-  // The last CodeQL release in the 2.19 series.
   "stable-v2.19.4",
   // The last CodeQL release in the 2.20 series.
   "stable-v2.20.7",
@@ -108,6 +139,10 @@ const defaultTestVersions = [
   "stable-v2.21.4",
   // The last CodeQL release in the 2.22 series.
   "stable-v2.22.4",
+  // The last CodeQL release in the 2.23 series.
+  "stable-v2.23.9",
+  // The last CodeQL release in the 2.24 series.
+  "stable-v2.24.3",
   // The default version of CodeQL for Dotcom, as determined by feature flags.
   "default",
   // The version of CodeQL shipped with the Action in `defaults.json`. During the release process
@@ -125,7 +160,7 @@ const defaultLanguageVersions = {
   java: "17",
   python: "3.13",
   csharp: "9.x",
-} as const satisfies Partial<Record<KnownLanguage, string>>;
+} as const satisfies Partial<Record<BuiltInLanguage, string>>;
 
 /** A mapping from known input names to their specifications. */
 const inputSpecs: WorkflowInputs = {
@@ -174,7 +209,11 @@ const languageSetups: LanguageSetups = {
     steps: [
       {
         name: "Install Node.js",
-        uses: "actions/setup-node@v6",
+        uses: pinnedUses(
+          "actions/setup-node",
+          "820762786026740c76f36085b0efc47a31fe5020",
+          "v7.0.0",
+        ),
         with: {
           "node-version": defaultLanguageVersions.javascript,
           cache: "npm",
@@ -192,7 +231,11 @@ const languageSetups: LanguageSetups = {
     steps: [
       {
         name: "Install Go",
-        uses: "actions/setup-go@v6",
+        uses: pinnedUses(
+          "actions/setup-go",
+          "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+          "v7.0.0",
+        ),
         with: {
           "go-version": `\${{ inputs.go-version || '${defaultLanguageVersions.go}' }}`,
           // to avoid potentially misleading autobuilder results where we expect it to download
@@ -208,7 +251,11 @@ const languageSetups: LanguageSetups = {
     steps: [
       {
         name: "Install Java",
-        uses: "actions/setup-java@v5",
+        uses: pinnedUses(
+          "actions/setup-java",
+          "b6effb05e454b25005698d916606bdc6ffcbf961",
+          "v5.7.0",
+        ),
         with: {
           "java-version": `\${{ inputs.java-version || '${defaultLanguageVersions.java}' }}`,
           distribution: "temurin",
@@ -222,7 +269,11 @@ const languageSetups: LanguageSetups = {
     steps: [
       {
         name: "Install Python",
-        uses: "actions/setup-python@v6",
+        uses: pinnedUses(
+          "actions/setup-python",
+          "5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "v7.0.0",
+        ),
         with: {
           "python-version": `\${{ inputs.python-version || '${defaultLanguageVersions.python}' }}`,
         },
@@ -235,7 +286,11 @@ const languageSetups: LanguageSetups = {
     steps: [
       {
         name: "Install .NET",
-        uses: "actions/setup-dotnet@v5",
+        uses: pinnedUses(
+          "actions/setup-dotnet",
+          "a98b56852c35b8e3190ac28c8c2271da59106c68",
+          "v6.0.0",
+        ),
         with: {
           "dotnet-version": `\${{ inputs.dotnet-version || '${defaultLanguageVersions.csharp}' }}`,
         },
@@ -304,6 +359,28 @@ function generateJobMatrix(
 ): Array<Record<string, any>> {
   let matrix: Array<Record<string, any>> = [];
 
+  const operatingSystems = checkSpecification.operatingSystems ?? ["ubuntu"];
+
+  // For each OS, collect the CodeQL versions explicitly claimed by entries that specify
+  // `codeql-versions`. A sibling entry for the same OS that omits `codeql-versions` runs all
+  // versions not in this set.
+  const claimedVersionsByOs = new Map<string, Set<string>>();
+  for (const operatingSystemConfig of operatingSystems) {
+    if (typeof operatingSystemConfig === "string") {
+      continue;
+    }
+    const entryVersions = operatingSystemConfig["codeql-versions"];
+    if (!entryVersions) {
+      continue;
+    }
+    const claimed =
+      claimedVersionsByOs.get(operatingSystemConfig.os) ?? new Set<string>();
+    for (const entryVersion of entryVersions) {
+      claimed.add(entryVersion);
+    }
+    claimedVersionsByOs.set(operatingSystemConfig.os, claimed);
+  }
+
   for (const version of checkSpecification.versions ?? defaultTestVersions) {
     if (version === "latest") {
       throw new Error(
@@ -311,10 +388,18 @@ function generateJobMatrix(
       );
     }
 
-    const runnerImages = ["ubuntu-latest", "macos-latest", "windows-latest"];
-    const operatingSystems = checkSpecification.operatingSystems ?? ["ubuntu"];
+    const defaultRunnerImages = [
+      "ubuntu-latest",
+      "macos-latest",
+      "windows-latest",
+    ];
 
-    for (const operatingSystem of operatingSystems) {
+    for (const operatingSystemConfig of operatingSystems) {
+      const operatingSystem =
+        typeof operatingSystemConfig === "string"
+          ? operatingSystemConfig
+          : operatingSystemConfig.os;
+
       // If osCodeQlVersions is set for this OS, only include the specified CodeQL versions.
       const allowedVersions =
         checkSpecification.osCodeQlVersions?.[operatingSystem];
@@ -322,9 +407,26 @@ function generateJobMatrix(
         continue;
       }
 
-      const runnerImagesForOs = runnerImages.filter((image) =>
-        image.startsWith(operatingSystem),
-      );
+      // An entry that specifies `codeql-versions` runs only those versions. A sibling entry for
+      // the same OS that omits `codeql-versions` runs all versions not claimed by its siblings.
+      const entryVersions =
+        typeof operatingSystemConfig === "string"
+          ? undefined
+          : operatingSystemConfig["codeql-versions"];
+      const runsThisVersion = entryVersions
+        ? entryVersions.includes(version)
+        : !claimedVersionsByOs.get(operatingSystem)?.has(version);
+      if (!runsThisVersion) {
+        continue;
+      }
+
+      const runnerImagesForOs =
+        typeof operatingSystemConfig === "string" ||
+        operatingSystemConfig["runner-image"] === undefined
+          ? defaultRunnerImages.filter((image) =>
+              image.startsWith(operatingSystem),
+            )
+          : [operatingSystemConfig["runner-image"]];
 
       for (const runnerImage of runnerImagesForOs) {
         matrix.push({
@@ -364,7 +466,7 @@ function getSetupSteps(checkSpecification: JobSpecification): {
   const inputs: Array<Set<KnownInputName>> = [];
   const steps: Step[] = [];
 
-  for (const language of Object.values(KnownLanguage).sort()) {
+  for (const language of Object.values(BuiltInLanguage).sort()) {
     const setupSpec = languageSetups[language];
 
     if (
@@ -425,7 +527,11 @@ function generateJob(
   const steps: Step[] = [
     {
       name: "Check out repository",
-      uses: "actions/checkout@v6",
+      uses: pinnedUses(
+        "actions/checkout",
+        "3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "v7.0.1",
+      ),
     },
     ...setupInfo.steps,
     {
@@ -659,9 +765,7 @@ function main(): void {
         push: {
           branches: ["main", "releases/v*"],
         },
-        pull_request: {
-          types: ["opened", "synchronize", "reopened", "ready_for_review"],
-        },
+        pull_request: {},
         merge_group: {
           types: ["checks_requested"],
         },

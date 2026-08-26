@@ -1,7 +1,10 @@
+import * as github from "@actions/github";
+
 import { isDynamicWorkflow } from "../actions-util";
 import { getRepositoryProperties } from "../api-client";
 import { Logger } from "../logging";
 import { RepositoryNwo } from "../repository";
+import { Failure, getErrorMessage, Result, Success } from "../util";
 
 /** The common prefix that we expect all of our repository properties to have. */
 export const GITHUB_CODEQL_PROPERTY_PREFIX = "github-codeql-";
@@ -10,16 +13,20 @@ export const GITHUB_CODEQL_PROPERTY_PREFIX = "github-codeql-";
  * Enumerates repository property names that have some meaning to us.
  */
 export enum RepositoryPropertyName {
+  CONFIG_FILE = "github-codeql-config-file",
   DISABLE_OVERLAY = "github-codeql-disable-overlay",
   EXTRA_QUERIES = "github-codeql-extra-queries",
   FILE_COVERAGE_ON_PRS = "github-codeql-file-coverage-on-prs",
+  TOOLS = "github-codeql-tools",
 }
 
 /** Parsed types of the known repository properties. */
 export type AllRepositoryProperties = {
+  [RepositoryPropertyName.CONFIG_FILE]: string;
   [RepositoryPropertyName.DISABLE_OVERLAY]: boolean;
   [RepositoryPropertyName.EXTRA_QUERIES]: string;
   [RepositoryPropertyName.FILE_COVERAGE_ON_PRS]: boolean;
+  [RepositoryPropertyName.TOOLS]: string;
 };
 
 /** Parsed repository properties. */
@@ -27,9 +34,11 @@ export type RepositoryProperties = Partial<AllRepositoryProperties>;
 
 /** Maps known repository properties to the type we expect to get from the API. */
 export type RepositoryPropertyApiType = {
+  [RepositoryPropertyName.CONFIG_FILE]: string;
   [RepositoryPropertyName.DISABLE_OVERLAY]: string;
   [RepositoryPropertyName.EXTRA_QUERIES]: string;
   [RepositoryPropertyName.FILE_COVERAGE_ON_PRS]: string;
+  [RepositoryPropertyName.TOOLS]: string;
 };
 
 /** The type of functions which take the `value` from the API and try to convert it to the type we want. */
@@ -74,9 +83,11 @@ const booleanProperty = {
 const repositoryPropertyParsers: {
   [K in RepositoryPropertyName]: PropertyInfo<K>;
 } = {
+  [RepositoryPropertyName.CONFIG_FILE]: stringProperty,
   [RepositoryPropertyName.DISABLE_OVERLAY]: booleanProperty,
   [RepositoryPropertyName.EXTRA_QUERIES]: stringProperty,
   [RepositoryPropertyName.FILE_COVERAGE_ON_PRS]: booleanProperty,
+  [RepositoryPropertyName.TOOLS]: stringProperty,
 };
 
 /**
@@ -225,4 +236,36 @@ const KNOWN_REPOSITORY_PROPERTY_NAMES = new Set<string>(
 /** Returns whether the given value is a known repository property name. */
 function isKnownPropertyName(name: string): name is RepositoryPropertyName {
   return KNOWN_REPOSITORY_PROPERTY_NAMES.has(name);
+}
+
+/**
+ * Loads [repository properties](https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization) if applicable.
+ */
+export async function loadRepositoryProperties(
+  repositoryNwo: RepositoryNwo,
+  logger: Logger,
+): Promise<Result<RepositoryProperties, unknown>> {
+  // See if we can skip loading repository properties early. In particular,
+  // repositories owned by users cannot have repository properties, so we can
+  // skip the API call entirely in that case.
+  const repositoryOwnerType = github.context.payload.repository?.owner.type;
+  logger.debug(
+    `Repository owner type is '${repositoryOwnerType ?? "unknown"}'.`,
+  );
+  if (repositoryOwnerType === "User") {
+    logger.debug(
+      "Skipping loading repository properties because the repository is owned by a user and " +
+        "therefore cannot have repository properties.",
+    );
+    return new Success({});
+  }
+
+  try {
+    return new Success(await loadPropertiesFromApi(logger, repositoryNwo));
+  } catch (error) {
+    logger.warning(
+      `Failed to load repository properties: ${getErrorMessage(error)}`,
+    );
+    return new Failure(error);
+  }
 }

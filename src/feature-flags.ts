@@ -26,12 +26,38 @@ const DEFAULT_VERSION_FEATURE_FLAG_SUFFIX = "_enabled";
 
 /**
  * The first version of the CodeQL Bundle that shipped with zstd-compressed bundles.
+ *
+ * This is now below the minimum version of CodeQL, but we keep this around because we currently set
+ * up CodeQL before checking that the version is new enough.
  */
 export const CODEQL_VERSION_ZSTD_BUNDLE = "2.19.0";
 
-export interface CodeQLDefaultVersionInfo {
+const LINKED_CODEQL_VERSION: CodeQLVersionInfo = {
+  cliVersion: defaults.cliVersion,
+  tagName: defaults.bundleVersion,
+};
+
+export interface CodeQLVersionInfo {
+  /** The version number of the CodeQL CLI, e.g. `2.19.0`. */
   cliVersion: string;
+  /**
+   * The tag name of the CodeQL Bundle associated with this version, e.g. `codeql-bundle-v2.19.0`.
+   */
   tagName: string;
+}
+
+export interface CodeQLDefaultVersionInfo {
+  /**
+   * CodeQL CLI versions that are enabled as defaults, sorted from highest to lowest.
+   *
+   * Guaranteed to be non-empty. When feature flags are unavailable, this falls back to a single
+   * entry containing the version pinned in `defaults.json`.
+   */
+  enabledVersions: CodeQLVersionInfo[];
+  /**
+   * If accessed, whether the tools feature flags are valid, i.e. contain at least one enabled
+   * version.
+   */
   toolsFeatureFlagsValid?: boolean;
 }
 
@@ -44,8 +70,13 @@ export interface CodeQLDefaultVersionInfo {
  * Legacy features should end with `_enabled`.
  */
 export enum Feature {
-  AllowToolcacheInput = "allow_toolcache_input",
+  /** Allows supported properties of configuration files to be merged. */
+  AllowMergeConfigFiles = "allow_merge_config_files",
+  /** Controls whether we allow multiple values for the `analysis-kinds` input. */
+  AllowMultipleAnalysisKinds = "allow_multiple_analysis_kinds",
   CleanupTrapCaches = "cleanup_trap_caches",
+  /** Whether to allow the `config-file` input to be specified via a repository property. */
+  ConfigFileRepositoryProperty = "config_file_repository_property",
   CppDependencyInstallation = "cpp_dependency_installation_enabled",
   CsharpCacheBuildModeNone = "csharp_cache_bmn",
   CsharpNewCacheKey = "csharp_new_cache_key",
@@ -54,6 +85,11 @@ export enum Feature {
   DisableJavaBuildlessEnabled = "disable_java_buildless_enabled",
   DisableKotlinAnalysisEnabled = "disable_kotlin_analysis_enabled",
   ExportDiagnosticsEnabled = "export_diagnostics_enabled",
+  /**
+   * Emergency override that forces the CodeQL CLI to use the JGit-based Git backend instead of its
+   * default backend selection.
+   */
+  ForceJGit = "force_jgit",
   ForceNightly = "force_nightly",
   IgnoreGeneratedFiles = "ignore_generated_files",
   JavaNetworkDebugging = "java_network_debugging",
@@ -72,12 +108,50 @@ export enum Feature {
   OverlayAnalysisGo = "overlay_analysis_go",
   OverlayAnalysisJava = "overlay_analysis_java",
   OverlayAnalysisJavascript = "overlay_analysis_javascript",
-  OverlayAnalysisPython = "overlay_analysis_python",
   /**
-   * Controls whether lower disk space requirements are used for overlay hardware checks.
-   * Has no effect if `OverlayAnalysisSkipResourceChecks` is enabled.
+   * When set, chooses the default CodeQL CLI version as the highest version that is both enabled by
+   * feature flags and present as an overlay-base database in the Actions cache for the configured
+   * languages. Falls back to the highest feature flagged version if no intersecting overlay-base
+   * database exists in the cache.
    */
-  OverlayAnalysisResourceChecksV2 = "overlay_analysis_resource_checks_v2",
+  OverlayAnalysisMatchCodeqlVersion = "overlay_analysis_match_codeql_version",
+  /**
+   * Like `OverlayAnalysisMatchCodeqlVersion`, but only logs a diagnostic with the version that
+   * would have been chosen instead of actually changing the default CodeQL CLI version.
+   * `OverlayAnalysisMatchCodeqlVersion` overrides this flag.
+   */
+  OverlayAnalysisMatchCodeqlVersionDryRun = "overlay_analysis_match_codeql_version_dry_run",
+  /**
+   * Lowers the overlay minimum available disk space to 8 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk8Gb = "overlay_analysis_min_disk_8_gb",
+  /**
+   * Lowers the overlay minimum available disk space to 9 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk9Gb = "overlay_analysis_min_disk_9_gb",
+  /**
+   * Lowers the overlay minimum available disk space to 10 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk10Gb = "overlay_analysis_min_disk_10_gb",
+  /**
+   * Lowers the overlay minimum available disk space to 11 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk11Gb = "overlay_analysis_min_disk_11_gb",
+  /**
+   * Lowers the overlay minimum available disk space to 12 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk12Gb = "overlay_analysis_min_disk_12_gb",
+  /**
+   * Lowers the overlay minimum available disk space to 13 GB. The lowest enabled limit wins; if
+   * none are enabled, the default applies.
+   */
+  OverlayAnalysisMinDisk13Gb = "overlay_analysis_min_disk_13_gb",
+  OverlayAnalysisPython = "overlay_analysis_python",
   OverlayAnalysisRuby = "overlay_analysis_ruby",
   /** Controls whether hardware checks are skipped for overlay analysis. */
   OverlayAnalysisSkipResourceChecks = "overlay_analysis_skip_resource_checks",
@@ -85,12 +159,14 @@ export enum Feature {
   OverlayAnalysisStatusCheck = "overlay_analysis_status_check",
   /** Controls whether overlay build failures on the default branch are stored in the Actions cache. */
   OverlayAnalysisStatusSave = "overlay_analysis_status_save",
-  PythonDefaultIsToNotExtractStdlib = "python_default_is_to_not_extract_stdlib",
   QaTelemetryEnabled = "qa_telemetry_enabled",
+  /** Routes (some) API requests through the registry proxy. */
+  ProxyApiRequests = "proxy_api_requests",
   /** Note that this currently only disables baseline file coverage information. */
   SkipFileCoverageOnPrs = "skip_file_coverage_on_prs",
-  StartProxyRemoveUnusedRegistries = "start_proxy_remove_unused_registries",
   StartProxyUseFeaturesRelease = "start_proxy_use_features_release",
+  /** Whether to allow the `tools` input to be specified via a repository property. */
+  ToolsRepositoryProperty = "tools_repository_property",
   UploadOverlayDbToApi = "upload_overlay_db_to_api",
   ValidateDbConfig = "validate_db_config",
 }
@@ -125,14 +201,24 @@ export type FeatureConfig = {
 };
 
 export const featureConfig = {
-  [Feature.AllowToolcacheInput]: {
+  [Feature.AllowMergeConfigFiles]: {
     defaultValue: false,
-    envVar: "CODEQL_ACTION_ALLOW_TOOLCACHE_INPUT",
+    envVar: "CODEQL_ACTION_ALLOW_MERGE_CONFIG_FILES",
+    minimumVersion: undefined,
+  },
+  [Feature.AllowMultipleAnalysisKinds]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_ALLOW_MULTIPLE_ANALYSIS_KINDS",
     minimumVersion: undefined,
   },
   [Feature.CleanupTrapCaches]: {
     defaultValue: false,
     envVar: "CODEQL_ACTION_CLEANUP_TRAP_CACHES",
+    minimumVersion: undefined,
+  },
+  [Feature.ConfigFileRepositoryProperty]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_CONFIG_FILE_REPOSITORY_PROPERTY",
     minimumVersion: undefined,
   },
   [Feature.CppDependencyInstallation]: {
@@ -177,6 +263,11 @@ export const featureConfig = {
     defaultValue: true,
     envVar: "CODEQL_ACTION_EXPORT_DIAGNOSTICS",
     legacyApi: true,
+    minimumVersion: undefined,
+  },
+  [Feature.ForceJGit]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_FORCE_JGIT",
     minimumVersion: undefined,
   },
   [Feature.ForceNightly]: {
@@ -278,9 +369,44 @@ export const featureConfig = {
     envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_DISABLE_TRAP_CACHING",
     minimumVersion: undefined,
   },
-  [Feature.OverlayAnalysisResourceChecksV2]: {
+  [Feature.OverlayAnalysisMatchCodeqlVersion]: {
     defaultValue: false,
-    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_RESOURCE_CHECKS_V2",
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MATCH_CODEQL_VERSION",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMatchCodeqlVersionDryRun]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MATCH_CODEQL_VERSION_DRY_RUN",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk8Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_8_GB",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk9Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_9_GB",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk10Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_10_GB",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk11Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_11_GB",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk12Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_12_GB",
+    minimumVersion: undefined,
+  },
+  [Feature.OverlayAnalysisMinDisk13Gb]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_MIN_DISK_13_GB",
     minimumVersion: undefined,
   },
   [Feature.OverlayAnalysisStatusCheck]: {
@@ -298,16 +424,15 @@ export const featureConfig = {
     envVar: "CODEQL_ACTION_OVERLAY_ANALYSIS_SKIP_RESOURCE_CHECKS",
     minimumVersion: undefined,
   },
-  [Feature.PythonDefaultIsToNotExtractStdlib]: {
-    defaultValue: false,
-    envVar: "CODEQL_ACTION_DISABLE_PYTHON_STANDARD_LIBRARY_EXTRACTION",
-    minimumVersion: undefined,
-    toolsFeature: ToolsFeature.PythonDefaultIsToNotExtractStdlib,
-  },
   [Feature.QaTelemetryEnabled]: {
     defaultValue: false,
     envVar: "CODEQL_ACTION_QA_TELEMETRY",
     legacyApi: true,
+    minimumVersion: undefined,
+  },
+  [Feature.ProxyApiRequests]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_PROXY_API_REQUESTS",
     minimumVersion: undefined,
   },
   [Feature.SkipFileCoverageOnPrs]: {
@@ -316,14 +441,14 @@ export const featureConfig = {
     minimumVersion: undefined,
     toolsFeature: ToolsFeature.SuppressesMissingFileBaselineWarning,
   },
-  [Feature.StartProxyRemoveUnusedRegistries]: {
-    defaultValue: false,
-    envVar: "CODEQL_ACTION_START_PROXY_REMOVE_UNUSED_REGISTRIES",
-    minimumVersion: undefined,
-  },
   [Feature.StartProxyUseFeaturesRelease]: {
     defaultValue: false,
     envVar: "CODEQL_ACTION_START_PROXY_USE_FEATURES_RELEASE",
+    minimumVersion: undefined,
+  },
+  [Feature.ToolsRepositoryProperty]: {
+    defaultValue: false,
+    envVar: "CODEQL_ACTION_TOOLS_REPOSITORY_PROPERTY",
     minimumVersion: undefined,
   },
   [Feature.UploadOverlayDbToApi]: {
@@ -353,8 +478,12 @@ export type FeatureWithoutCLI = {
 }[keyof typeof featureConfig];
 
 export interface FeatureEnablement {
-  /** Gets the default version of the CodeQL tools. */
-  getDefaultCliVersion(
+  /**
+   * Returns the set of default CodeQL CLI versions to consider, sorted from
+   * highest to lowest. The first entry is the version that the CodeQL Action
+   * will use by default. The list is always non-empty.
+   */
+  getEnabledDefaultCliVersions(
     variant: util.GitHubVariant,
   ): Promise<CodeQLDefaultVersionInfo>;
   getValue(feature: FeatureWithoutCLI): Promise<boolean>;
@@ -378,12 +507,11 @@ export const FEATURE_FLAGS_FILE_NAME = "cached-feature-flags.json";
 class OfflineFeatures implements FeatureEnablement {
   constructor(protected readonly logger: Logger) {}
 
-  async getDefaultCliVersion(
+  async getEnabledDefaultCliVersions(
     _variant: util.GitHubVariant,
   ): Promise<CodeQLDefaultVersionInfo> {
     return {
-      cliVersion: defaults.cliVersion,
-      tagName: defaults.bundleVersion,
+      enabledVersions: [LINKED_CODEQL_VERSION],
     };
   }
 
@@ -393,7 +521,7 @@ class OfflineFeatures implements FeatureEnablement {
   getFeatureConfig(feature: Feature): FeatureConfig {
     // Narrow the type to FeatureConfig to avoid type errors. To avoid unsafe use of `as`, we
     // check that the required properties exist using `satisfies`.
-    return featureConfig[feature] satisfies FeatureConfig as FeatureConfig;
+    return featureConfig[feature] satisfies FeatureConfig;
   }
 
   /**
@@ -525,13 +653,13 @@ class Features extends OfflineFeatures {
     );
   }
 
-  async getDefaultCliVersion(
+  async getEnabledDefaultCliVersions(
     variant: util.GitHubVariant,
   ): Promise<CodeQLDefaultVersionInfo> {
     if (supportsFeatureFlags(variant)) {
-      return await this.gitHubFeatureFlags.getDefaultCliVersionFromFlags();
+      return await this.gitHubFeatureFlags.getEnabledDefaultCliVersionsFromFlags();
     }
-    return super.getDefaultCliVersion(variant);
+    return super.getEnabledDefaultCliVersions(variant);
   }
 
   /**
@@ -607,16 +735,22 @@ class GitHubFeatureFlags {
     return version;
   }
 
-  async getDefaultCliVersionFromFlags(): Promise<CodeQLDefaultVersionInfo> {
+  /**
+   * Returns CLI versions enabled by `default_codeql_version_*_enabled` feature
+   * flags, sorted from highest to lowest. Falls back to the version pinned in
+   * `defaults.json` if no such flags are enabled.
+   */
+  async getEnabledDefaultCliVersionsFromFlags(): Promise<CodeQLDefaultVersionInfo> {
     const response = await this.getAllFeatures();
 
-    const enabledFeatureFlagCliVersions = Object.entries(response)
+    const sortedCliVersions = Object.entries(response)
       .map(([f, isEnabled]) =>
         isEnabled ? this.getCliVersionFromFeatureFlag(f) : undefined,
       )
-      .filter((f): f is string => f !== undefined);
+      .filter((f): f is string => f !== undefined)
+      .sort(semver.rcompare);
 
-    if (enabledFeatureFlagCliVersions.length === 0) {
+    if (sortedCliVersions.length === 0) {
       // We expect at least one default CLI version to be enabled on Dotcom at any time. However if
       // the feature flags are misconfigured, rather than crashing, we fall back to the CLI version
       // shipped with the Action in defaults.json. This has the effect of immediately rolling out
@@ -632,8 +766,7 @@ class GitHubFeatureFlags {
           `shipped with the Action. This is ${defaults.cliVersion}.`,
       );
       const result: CodeQLDefaultVersionInfo = {
-        cliVersion: defaults.cliVersion,
-        tagName: defaults.bundleVersion,
+        enabledVersions: [LINKED_CODEQL_VERSION],
       };
       if (this.hasAccessedRemoteFeatureFlags) {
         result.toolsFeatureFlagsValid = false;
@@ -641,17 +774,14 @@ class GitHubFeatureFlags {
       return result;
     }
 
-    const maxCliVersion = enabledFeatureFlagCliVersions.reduce(
-      (maxVersion, currentVersion) =>
-        currentVersion > maxVersion ? currentVersion : maxVersion,
-      enabledFeatureFlagCliVersions[0],
-    );
     this.logger.debug(
-      `Derived default CLI version of ${maxCliVersion} from feature flags.`,
+      `Derived default CLI version of ${sortedCliVersions[0]} from feature flags.`,
     );
     return {
-      cliVersion: maxCliVersion,
-      tagName: `codeql-bundle-v${maxCliVersion}`,
+      enabledVersions: sortedCliVersions.map((cliVersion) => ({
+        cliVersion,
+        tagName: `codeql-bundle-v${cliVersion}`,
+      })),
       toolsFeatureFlagsValid: true,
     };
   }

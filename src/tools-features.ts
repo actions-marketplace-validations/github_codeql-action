@@ -1,15 +1,12 @@
 import * as semver from "semver";
 
-import type { VersionInfo } from "./codeql";
+import type { VersionInfo } from "./cli/types";
 
 export enum ToolsFeature {
   BuiltinExtractorsSpecifyDefaultQueries = "builtinExtractorsSpecifyDefaultQueries",
   BundleSupportsIncludeOption = "bundleSupportsIncludeOption",
   BundleSupportsOverlay = "bundleSupportsOverlay",
-  DatabaseInterpretResultsSupportsSarifRunProperty = "databaseInterpretResultsSupportsSarifRunProperty",
-  ForceOverwrite = "forceOverwrite",
   IndirectTracingSupportsStaticBinaries = "indirectTracingSupportsStaticBinaries",
-  PythonDefaultIsToNotExtractStdlib = "pythonDefaultIsToNotExtractStdlib",
   SuppressesMissingFileBaselineWarning = "suppressesMissingFileBaselineWarning",
 }
 

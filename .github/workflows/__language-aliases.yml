@@ -12,12 +12,7 @@ on:
     branches:
       - main
       - releases/v*
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+  pull_request: {}
   merge_group:
     types:
       - checks_requested
@@ -50,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Prepare test
         id: prepare-test
         uses: ./.github/actions/prepare-test
@@ -60,12 +55,12 @@ jobs:
           setup-kotlin: 'true'
       - uses: ./../action/init
         with:
-          languages: C#,java-kotlin,swift,typescript
+          languages: C#,java-kotlin,typescript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
 
       - name: 'Check languages'
         run: |
-          expected_languages="csharp,java,swift,javascript"
+          expected_languages="csharp,java,javascript"
           actual_languages=$(jq -r '.languages | join(",")' "$RUNNER_TEMP"/config)
 
           if [ "$expected_languages" != "$actual_languages" ]; then
